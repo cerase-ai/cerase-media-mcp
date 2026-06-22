@@ -1,0 +1,5 @@
+# cerase-media MCP — Python dependency lock (M-MEDIA-1).
+# ffmpeg comes from the base image (apt), not pip.
+mcp>=1.0,<2.0
+mcp-proxy>=0.3,<1.0
+openai>=1.40,<2.0
