@@ -193,7 +193,7 @@ def _one_source(*sources: str | None) -> None:
         raise ValueError("supply exactly one source argument")
 
 
-async def _load_workspace_bytes(agent_id: str, path: str) -> bytes:
+async def _load_workspace_bytes(agent_id: str, path: str, binding: str = "") -> bytes:
     """M-UPLOAD-2 — read an uploaded workspace file's CONTENT.
 
     This is a SHARED runner that mounts no agent work volume, so a `path`
@@ -221,24 +221,30 @@ async def _load_workspace_bytes(agent_id: str, path: str) -> bytes:
         )
     import httpx
 
+    # M-SEC-TOKEN-BINDING-1: the control-plane broker requires the calling
+    # agent's binding (gateway-injected tool arg) besides the shared bearer.
+    headers = {"Authorization": f"Bearer {secret}"}
+    if binding:
+        headers["X-Cerase-Agent-Binding"] = binding
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(
             f"{cp}/api/internal/workspace-file/{agent_id}",
             params={"path": path},
-            headers={"Authorization": f"Bearer {secret}"},
+            headers=headers,
         )
         resp.raise_for_status()
         return resp.content
 
 
 async def _image_data_url(
-    agent_id: str, path: str | None, image_url: str | None, image_base64: str | None
+    agent_id: str, path: str | None, image_url: str | None, image_base64: str | None,
+    binding: str = "",
 ) -> str:
     """Resolve the single image source into a URL the vision model can
     consume (workspace paths become data URLs)."""
     _one_source(path, image_url, image_base64)
     if path:
-        data = await _load_workspace_bytes(agent_id, path)
+        data = await _load_workspace_bytes(agent_id, path, binding)
         mime = mimetypes.guess_type(path)[0] or "image/png"
         b64 = base64.b64encode(data).decode("ascii")
         return f"data:{mime};base64,{b64}"
@@ -246,11 +252,12 @@ async def _image_data_url(
 
 
 async def _load_audio_bytes(
-    agent_id: str, path: str | None, audio_url: str | None, audio_base64: str | None
+    agent_id: str, path: str | None, audio_url: str | None, audio_base64: str | None,
+    binding: str = "",
 ) -> bytes:
     _one_source(path, audio_url, audio_base64)
     if path:
-        return await _load_workspace_bytes(agent_id, path)
+        return await _load_workspace_bytes(agent_id, path, binding)
     if audio_url:
         # M-SEC-SAFEFETCH-1: only public http(s) targets — never file://
         # nor loopback/private/metadata addresses (SSRF); size-bounded
@@ -314,6 +321,7 @@ async def ocr(
     image_url: str | None = None,
     image_base64: str | None = None,
     prompt: str | None = None,
+    agent_binding: str = "",
 ) -> dict[str, Any]:
     """Extract the TEXT written in an image via a vision LLM.
 
@@ -329,13 +337,15 @@ async def ocr(
         image_base64: a `data:image/...;base64,...` data URL.
         prompt: optional instruction override (default = full
             transcription).
+        agent_binding: injected by the platform (M-SEC-TOKEN-BINDING-1
+            second factor for the workspace-file broker) — do not set it.
 
     Returns:
         dict with `text` (the transcription) and `model`.
     """
     if not agent_id:
         raise ValueError("agent_id is required (cannot be empty)")
-    url = await _image_data_url(agent_id, path, image_url, image_base64)
+    url = await _image_data_url(agent_id, path, image_url, image_base64, agent_binding)
     text = await _multimodal(agent_id, [
         {"type": "text", "text": prompt or _OCR_PROMPT},
         {"type": "image_url", "image_url": {"url": url}},
@@ -350,6 +360,7 @@ async def describe_image(
     image_url: str | None = None,
     image_base64: str | None = None,
     prompt: str | None = None,
+    agent_binding: str = "",
 ) -> dict[str, Any]:
     """Describe what is VISIBLE in an image via a vision LLM.
 
@@ -366,13 +377,15 @@ async def describe_image(
         prompt: optional specific question or instruction — pass the
             user's own question in the user's language to get the answer
             in that language.
+        agent_binding: injected by the platform (M-SEC-TOKEN-BINDING-1
+            second factor for the workspace-file broker) — do not set it.
 
     Returns:
         dict with `description` and `model`.
     """
     if not agent_id:
         raise ValueError("agent_id is required (cannot be empty)")
-    url = await _image_data_url(agent_id, path, image_url, image_base64)
+    url = await _image_data_url(agent_id, path, image_url, image_base64, agent_binding)
     description = await _multimodal(agent_id, [
         {"type": "text", "text": prompt or _DESCRIBE_PROMPT},
         {"type": "image_url", "image_url": {"url": url}},
@@ -386,6 +399,7 @@ async def analyze_ui(
     path: str | None = None,
     image_url: str | None = None,
     image_base64: str | None = None,
+    agent_binding: str = "",
 ) -> dict[str, Any]:
     """Analyze a UI screenshot and return a structured UX/UI audit.
 
@@ -399,13 +413,15 @@ async def analyze_ui(
             skill uses). Use this OR image_url OR image_base64.
         image_url: http(s) URL of the screenshot.
         image_base64: a `data:image/...;base64,...` data URL.
+        agent_binding: injected by the platform (M-SEC-TOKEN-BINDING-1
+            second factor for the workspace-file broker) — do not set it.
 
     Returns:
         dict with `analysis` (Markdown report) and `model`.
     """
     if not agent_id:
         raise ValueError("agent_id is required (cannot be empty)")
-    url = await _image_data_url(agent_id, path, image_url, image_base64)
+    url = await _image_data_url(agent_id, path, image_url, image_base64, agent_binding)
     analysis = await _multimodal(agent_id, [
         {"type": "text", "text": _ANALYZE_UI_PROMPT},
         {"type": "image_url", "image_url": {"url": url}},
@@ -422,6 +438,7 @@ async def compare_screenshots(
     path2: str | None = None,
     image2_url: str | None = None,
     image2_base64: str | None = None,
+    agent_binding: str = "",
 ) -> dict[str, Any]:
     """Compare two UI screenshots and report visual differences.
 
@@ -439,6 +456,8 @@ async def compare_screenshots(
             Use this OR image2_url OR image2_base64.
         image2_url: http(s) URL of the changed screenshot.
         image2_base64: data-URL of the changed screenshot.
+        agent_binding: injected by the platform (M-SEC-TOKEN-BINDING-1
+            second factor for the workspace-file broker) — do not set it.
 
     Returns:
         dict with `diff` (Markdown report) and `model`.
@@ -453,8 +472,8 @@ async def compare_screenshots(
         _one_source(path2, image2_url, image2_base64)
     except ValueError:
         raise ValueError("supply exactly one source for image2 (path2, image2_url, or image2_base64)")
-    url1 = await _image_data_url(agent_id, path1, image1_url, image1_base64)
-    url2 = await _image_data_url(agent_id, path2, image2_url, image2_base64)
+    url1 = await _image_data_url(agent_id, path1, image1_url, image1_base64, agent_binding)
+    url2 = await _image_data_url(agent_id, path2, image2_url, image2_base64, agent_binding)
     diff_text = await _multimodal(agent_id, [
         {"type": "text", "text": _COMPARE_SCREENSHOTS_PROMPT},
         {"type": "image_url", "image_url": {"url": url1}},
@@ -470,6 +489,7 @@ async def transcribe(
     audio_url: str | None = None,
     audio_base64: str | None = None,
     language: str | None = None,
+    agent_binding: str = "",
 ) -> dict[str, Any]:
     """Transcribe an audio file to text via a multimodal LLM.
 
@@ -484,13 +504,17 @@ async def transcribe(
             (local files must use `path`, not a file:// URL).
         audio_base64: a base64 / data-URL audio payload.
         language: optional ISO hint (e.g. "it") to bias the model.
+        agent_binding: injected by the platform (M-SEC-TOKEN-BINDING-1
+            second factor for the workspace-file broker) — do not set it.
 
     Returns:
         dict with `text` (the transcription) and `model`.
     """
     if not agent_id:
         raise ValueError("agent_id is required (cannot be empty)")
-    mp3 = await _normalise_to_mp3(await _load_audio_bytes(agent_id, path, audio_url, audio_base64))
+    mp3 = await _normalise_to_mp3(
+        await _load_audio_bytes(agent_id, path, audio_url, audio_base64, agent_binding)
+    )
     b64 = base64.b64encode(mp3).decode("ascii")
     hint = f" The audio is in {language}." if language else ""
 
