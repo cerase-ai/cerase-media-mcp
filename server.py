@@ -32,10 +32,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import mimetypes
 import os
+import socket
 import tempfile
 from typing import Any
+from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
 
@@ -99,6 +102,80 @@ def _safe_local_path(path: str) -> str:
     if resolved != root and not resolved.startswith(root + os.sep):
         raise ValueError("path escapes the workspace root")
     return resolved
+
+
+# M-SEC-SAFEFETCH-1 — cap on remote audio downloads (bytes).
+_MAX_FETCH_BYTES = int(os.environ.get("CERASE_FETCH_MAX_BYTES", 50 * 1024 * 1024))
+
+
+def _validate_fetch_url(url: str) -> str:
+    """M-SEC-SAFEFETCH-1 — SSRF/LFI guard for a caller-supplied fetch URL.
+
+    Only http(s) URLs whose host resolves to a public address may be
+    fetched server-side: file:// / ftp:// / any other scheme is refused,
+    as is any host that is — or resolves to — a loopback, link-local,
+    private (RFC1918), reserved or otherwise non-public address (kills
+    the cloud-metadata classic 169.254.169.254 and pivots into the
+    compose-internal network). `CERASE_FETCH_ALLOWED_HOSTS` (comma-
+    separated, exact hostnames, case-insensitive) optionally pins the
+    reachable hosts. Fail-closed: unparseable or unresolvable → raise.
+    Mirrors the PHP contract in control-plane `App\\Support\\SafeHttp`.
+    """
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").strip().lower()
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"unparseable URL — refusing to fetch: {exc}") from exc
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"URL scheme {parsed.scheme!r} refused — only http/https may be fetched"
+        )
+    if not host:
+        raise ValueError("URL has no host — refusing to fetch")
+
+    allowlist = {
+        h.strip().lower()
+        for h in os.environ.get("CERASE_FETCH_ALLOWED_HOSTS", "").split(",")
+        if h.strip()
+    }
+    if allowlist and host not in allowlist:
+        raise ValueError(f"host {host!r} is not on the fetch allowlist")
+
+    # Name-based fast fail — resolver-independent.
+    if host == "localhost" or host.endswith(".localhost"):
+        raise ValueError("refusing to fetch localhost")
+
+    try:
+        infos = socket.getaddrinfo(
+            host, port or (443 if parsed.scheme == "https" else 80),
+            proto=socket.IPPROTO_TCP,
+        )
+    except (socket.gaierror, OSError) as exc:
+        raise ValueError(
+            f"could not resolve host {host!r} — refusing to fetch (fail-closed)"
+        ) from exc
+    if not infos:
+        raise ValueError(
+            f"could not resolve host {host!r} — refusing to fetch (fail-closed)"
+        )
+    for info in infos:
+        addr = ipaddress.ip_address(info[4][0].split("%")[0])
+        if (
+            str(addr) == "169.254.169.254"  # cloud metadata — named explicitly
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_private
+            or addr.is_reserved
+            or addr.is_multicast
+            or addr.is_unspecified
+            or not addr.is_global  # CGNAT, TEST-NETs, anything else non-public
+        ):
+            raise ValueError(
+                f"host {host!r} points at a private/reserved address ({addr}) — "
+                "server-side fetch refused"
+            )
+    return url
 
 
 def _client():
@@ -175,12 +252,25 @@ async def _load_audio_bytes(
     if path:
         return await _load_workspace_bytes(agent_id, path)
     if audio_url:
+        # M-SEC-SAFEFETCH-1: only public http(s) targets — never file://
+        # nor loopback/private/metadata addresses (SSRF); size-bounded
+        # stream (httpx does not follow redirects by default — keep that).
+        _validate_fetch_url(audio_url)
         import httpx
 
         async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.get(audio_url)
-            resp.raise_for_status()
-            return resp.content
+            async with client.stream("GET", audio_url) as resp:
+                resp.raise_for_status()
+                total = 0
+                chunks: list[bytes] = []
+                async for chunk in resp.aiter_bytes():
+                    total += len(chunk)
+                    if total > _MAX_FETCH_BYTES:
+                        raise ValueError(
+                            f"audio download exceeds the {_MAX_FETCH_BYTES}-byte limit"
+                        )
+                    chunks.append(chunk)
+                return b"".join(chunks)
     payload = audio_base64 or ""
     if "," in payload and payload.strip().startswith("data:"):
         payload = payload.split(",", 1)[1]
@@ -390,7 +480,8 @@ async def transcribe(
         agent_id: Cerase Agent PK — bound by the gateway. Required.
         path: workspace file path (the form the attachment-receiver
             skill uses). Use this OR audio_url OR audio_base64.
-        audio_url: http(s) URL of the audio.
+        audio_url: http(s) URL of the audio — public remote hosts only
+            (local files must use `path`, not a file:// URL).
         audio_base64: a base64 / data-URL audio payload.
         language: optional ISO hint (e.g. "it") to bias the model.
 
