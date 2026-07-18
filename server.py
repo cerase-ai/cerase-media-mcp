@@ -47,7 +47,8 @@ from mcp.server.fastmcp import FastMCP
 # MCP stdio transport uses stdout as the JSON-RPC channel — any log on stdout
 # corrupts the protocol. Own the stderr invariant explicitly (don't depend on
 # the mcp SDK's default handler, which could change across versions) and quiet
-# httpx so backend request URLs don't leak into the logs.
+# httpx so backend request URLs don't leak into the logs. (Shared stdio-logging
+# bootstrap across the first-party MCP connectors — search / media / docreader.)
 logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
