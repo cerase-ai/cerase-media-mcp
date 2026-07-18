@@ -33,14 +33,23 @@ from __future__ import annotations
 import asyncio
 import base64
 import ipaddress
+import logging
 import mimetypes
 import os
 import socket
+import sys
 import tempfile
 from typing import Any
 from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
+
+# MCP stdio transport uses stdout as the JSON-RPC channel — any log on stdout
+# corrupts the protocol. Own the stderr invariant explicitly (don't depend on
+# the mcp SDK's default handler, which could change across versions) and quiet
+# httpx so backend request URLs don't leak into the logs.
+logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 mcp = FastMCP("cerase-media")
 
