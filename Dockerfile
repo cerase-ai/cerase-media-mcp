@@ -20,6 +20,12 @@ RUN pip install --no-cache-dir -r /tmp/requirements.lock \
 
 COPY server.py chunker.py transcription_api.py /app/
 
+# The liveness probe below is a real MCP client, not a socket connect: with the
+# stdio child gone mcp-proxy keeps the listener open and answers the handshake
+# from what it recorded at its own startup, so the connect went on passing for a
+# container with no server left in it. The script's header carries the detail.
+COPY scripts/healthcheck.py /app/healthcheck.py
+
 RUN groupadd -r appuser \
  && useradd -r -g appuser -u 1000 -m -d /home/appuser -s /usr/sbin/nologin appuser \
  && chown -R appuser:appuser /app
@@ -34,7 +40,11 @@ EXPOSE 8080
 
 # M-CI-3: image-level liveness — runtime-spawned MCP containers have no
 # compose healthcheck, this is the only signal `docker ps`/doctor sees.
+#
+# It completes the handshake and lists this server's tools, which is the first
+# request that has to reach the stdio child. The script keeps itself inside the
+# timeout by budget, so the timeout below is its ceiling and not its schedule.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python3 -c "import socket; socket.create_connection(('127.0.0.1', 3000), timeout=5)" || exit 1
+    CMD python3 /app/healthcheck.py || exit 1
 
 ENTRYPOINT ["sh", "-c", "exec mcp-proxy --port 3000 --host 0.0.0.0 --pass-environment -- python /app/server.py"]
