@@ -18,7 +18,7 @@ COPY requirements.txt requirements.lock /tmp/
 RUN pip install --no-cache-dir -r /tmp/requirements.lock \
     && rm /tmp/requirements.txt /tmp/requirements.lock
 
-COPY server.py /app/server.py
+COPY server.py chunker.py transcription_api.py /app/
 
 RUN groupadd -r appuser \
  && useradd -r -g appuser -u 1000 -m -d /home/appuser -s /usr/sbin/nologin appuser \
@@ -27,6 +27,10 @@ USER appuser
 WORKDIR /home/appuser
 
 EXPOSE 3000
+# The same code serves an OpenAI-compatible transcription endpoint when the
+# entrypoint is replaced with the uvicorn one the compose service uses. The
+# port is declared here so the two surfaces stay documented together.
+EXPOSE 8080
 
 # M-CI-3: image-level liveness — runtime-spawned MCP containers have no
 # compose healthcheck, this is the only signal `docker ps`/doctor sees.

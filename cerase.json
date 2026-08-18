@@ -12,5 +12,13 @@
   "auth": {
     "kind": "none",
     "credential_scope": "tenant"
+  },
+  "tool_runtime": {
+    "tools": {
+      "transcribe": {
+        "pool": "slow",
+        "timeout_seconds": 900
+      }
+    }
   }
 }

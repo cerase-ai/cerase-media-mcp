@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Cerase Media MCP — first-party multimodal understanding via cerase-litellm.
 
-M-MEDIA-1: the merge of cerase-ocr + cerase-transcriber (operator
-2026-06-12) — one container, three ASYNC tools, so concurrent requests
-ride parallel I/O lanes instead of one queue (the tools are ~100%%
-LLM-wait). Uses the `multimodal` tool-model alias through cerase-litellm
+Merges cerase-ocr + cerase-transcriber into one container with three
+ASYNC tools, so concurrent requests ride parallel I/O lanes instead of
+one queue (the tools are ~100%% LLM-wait). Uses the `multimodal`
+tool-model alias through cerase-litellm
 and injects the calling Agent's id into LiteLLM metadata for per-agent
 billing (×1 multimodal).
 
@@ -43,6 +43,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
+
+import chunker
 
 # MCP stdio transport uses stdout as the JSON-RPC channel — any log on stdout
 # corrupts the protocol. Own the stderr invariant explicitly (don't depend on
@@ -114,15 +116,16 @@ def _safe_local_path(path: str) -> str:
     return resolved
 
 
-# M-SEC-SAFEFETCH-1 — cap on remote audio downloads (bytes).
+# Cap on remote audio downloads, in bytes.
 _MAX_FETCH_BYTES = int(os.environ.get("CERASE_FETCH_MAX_BYTES", 50 * 1024 * 1024))
 
-# Audio tokenises at a measured, content-independent 25 tokens per second
-# (90,000/hour), and speech transcribes to far fewer tokens than the audio
-# itself carries. 40 output tokens per second of audio is roughly 8x the
-# densest real speech, so it never truncates an honest transcript while still
-# bounding a runaway to a small multiple of the correct cost. The floor covers
-# clips too short for the rate to mean anything.
+# Audio tokenises at a measured,
+# content-independent 25 tokens per second (90,000/hour), and speech
+# transcribes to far fewer tokens than the audio itself carries. 40 output
+# tokens per second of audio is roughly 8x the densest real speech, so it
+# never truncates an honest transcript while still bounding a runaway to a
+# small multiple of the correct cost. The floor covers clips too short for
+# the rate to mean anything.
 _TRANSCRIBE_TOKENS_PER_AUDIO_SECOND = int(
     os.environ.get("CERASE_TRANSCRIBE_TOKENS_PER_AUDIO_SECOND", 20)
 )
@@ -134,19 +137,34 @@ _TRANSCRIBE_MIN_TOKENS = int(os.environ.get("CERASE_TRANSCRIBE_MIN_TOKENS", 512)
 # half the model ceiling -- roughly twice the densest hour of Italian speech,
 # so an honest transcript never reaches it, while a runaway costs half of what
 # it did. Long audio should not arrive here in one payload at all; that is
-# M-TRANSCRIPTION-CHUNKER-1, and this is the floor under it until then.
+# a chunking layer's job, and this is the floor under it until there is one.
 _TRANSCRIBE_MAX_TOKENS = int(os.environ.get("CERASE_TRANSCRIBE_MAX_TOKENS", 32_768))
 
 TRUNCATION_MARKER = "\n\n[transcription truncated: output ceiling reached]"
+
+# How many chunks of one recording are in flight at once. Every chunk is a
+# separate billed call and the model provider rate-limits, so this is the
+# throughput knob: an hour of audio finishes in about a chunk's latency times
+# the number of chunks divided by this. It is deliberately smaller than the
+# gateway's slow pool, so one long transcription cannot use up the provider
+# concurrency the other tenants of that pool need.
+_TRANSCRIBE_CONCURRENCY = int(os.environ.get("CERASE_TRANSCRIBE_CONCURRENCY", 4))
+
+# Silence prepended to every piece of audio before it goes to the model,
+# because a payload that opens on a word loses that sentence. It costs about
+# twenty-five input tokens.
+_CHUNK_LEAD_SILENCE_SECONDS = float(
+    os.environ.get("CERASE_TRANSCRIBE_LEAD_SILENCE_SECONDS", 1.0)
+)
 
 
 def transcription_token_budget(duration_seconds: float) -> int:
     """The output ceiling for an audio payload of this duration.
 
-    Public and pure so a test can exercise THIS rule rather than a copy of it:
-    reaching `transcribe` needs a model, a gateway and an agent, and a test
-    that re-implemented the arithmetic would keep passing after the arithmetic
-    changed.
+    Public and pure so a test can exercise THIS rule rather than a copy of
+    it: reaching `transcribe` needs a model, a gateway and an agent, and a
+    test that re-implemented the arithmetic would keep passing after the
+    arithmetic changed.
     """
     if duration_seconds <= 0:
         return _TRANSCRIBE_MIN_TOKENS
@@ -160,7 +178,7 @@ def transcription_token_budget(duration_seconds: float) -> int:
 
 
 def _validate_fetch_url(url: str) -> str:
-    """M-SEC-SAFEFETCH-1 — SSRF/LFI guard for a caller-supplied fetch URL.
+    """SSRF/LFI guard for a caller-supplied fetch URL.
 
     Only http(s) URLs whose host resolves to a public address may be
     fetched server-side: file:// / ftp:// / any other scheme is refused,
@@ -245,7 +263,7 @@ def _one_source(*sources: str | None) -> None:
 
 
 async def _load_workspace_bytes(agent_id: str, path: str, binding: str = "") -> bytes:
-    """M-UPLOAD-2 — read an uploaded workspace file's CONTENT.
+    """Read an uploaded workspace file's CONTENT.
 
     This is a SHARED runner that mounts no agent work volume, so a `path`
     cannot be `open()`-ed locally in production. Try a local mount first
@@ -272,8 +290,8 @@ async def _load_workspace_bytes(agent_id: str, path: str, binding: str = "") -> 
         )
     import httpx
 
-    # M-SEC-TOKEN-BINDING-1: the control-plane broker requires the calling
-    # agent's binding (gateway-injected tool arg) besides the shared bearer.
+    # The control-plane broker requires the calling agent's binding
+    # (gateway-injected tool arg) besides the shared bearer.
     headers = {"Authorization": f"Bearer {secret}"}
     if binding:
         headers["X-Cerase-Agent-Binding"] = binding
@@ -310,8 +328,8 @@ async def _load_audio_bytes(
     if path:
         return await _load_workspace_bytes(agent_id, path, binding)
     if audio_url:
-        # M-SEC-SAFEFETCH-1: only public http(s) targets — never file://
-        # nor loopback/private/metadata addresses (SSRF); size-bounded
+        # Only public http(s) targets — never file:// nor
+        # loopback/private/metadata addresses (SSRF); size-bounded
         # stream (httpx does not follow redirects by default — keep that).
         _validate_fetch_url(audio_url)
         import httpx
@@ -337,14 +355,7 @@ async def _load_audio_bytes(
 
 async def _normalise_to_mp3(raw: bytes) -> tuple[bytes, float]:
     """Transcode arbitrary audio to mono 16k mp3 via ffmpeg (async
-    subprocess — a long transcode never blocks the other lanes).
-
-    Returns the bytes AND the duration in seconds, because the caller needs
-    the duration to bound the output and asking ffprobe separately would
-    decode the same file twice. A duration ffprobe cannot determine comes back
-    as 0.0 and the caller falls back to its floor, rather than the transcode
-    failing over a number that is only used for a ceiling.
-    """
+    subprocess — a long transcode never blocks the other lanes)."""
     with tempfile.TemporaryDirectory() as d:
         src = os.path.join(d, "in")
         dst = os.path.join(d, "out.mp3")
@@ -364,7 +375,12 @@ async def _normalise_to_mp3(raw: bytes) -> tuple[bytes, float]:
 
 
 async def _duration_seconds(path: str) -> float:
-    """Audio duration via ffprobe, or 0.0 when it cannot be determined."""
+    """Audio duration via ffprobe, or 0.0 when it cannot be determined.
+
+    A duration ffprobe cannot read must not fail the transcode: the number is
+    only used to pick an output ceiling, and the caller falls back to its
+    floor.
+    """
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -386,13 +402,13 @@ async def _multimodal(
     """One multimodal call, billed to the calling agent.
 
     `max_tokens` is a COST CEILING, not a quality setting. Without it a
-    transcription can run away: measured 2026-08-18 against the running
-    appliance, three audio files of five, thirty and forty-five minutes each
-    came back at the model's own 65,535-token ceiling, and on the longest one
-    the output was 56% of the call's cost -- a five-minute voice note billed
-    58x a one-minute one. Callers that can bound their output pass a bound;
-    callers that cannot (OCR, image description) pass None and keep the
-    previous behaviour, because their input is inherently small.
+    transcription can run away — measured against a running appliance,
+    where audio of five, thirty and forty-five
+    minutes each came back at the model's own 65,535-token ceiling, and on the
+    longest the output was 56% of the call's cost: a five-minute voice note
+    billed 58x a one-minute one. Callers that can bound their output pass a
+    bound; OCR and image description pass None and keep the old behaviour,
+    their input being inherently small.
     """
     kwargs: dict[str, Any] = {}
     if max_tokens is not None:
@@ -406,10 +422,10 @@ async def _multimodal(
     if not resp.choices:
         return ""
     text = resp.choices[0].message.content or ""
-    # A ceiling that silently truncates is worse than no ceiling: the caller
-    # gets a transcript that LOOKS whole and is not. The marker is appended to
-    # the text rather than returned beside it so that every consumer sees it --
-    # a separate field is one an existing caller would not read.
+    # A ceiling that truncates in silence is worse than no ceiling: the caller
+    # is handed a transcript that LOOKS whole. The marker goes into the text
+    # rather than beside it, so every consumer sees it — a separate field is
+    # one an existing caller would not read.
     if getattr(resp.choices[0], "finish_reason", None) == "length":
         text += TRUNCATION_MARKER
     return text
@@ -438,8 +454,8 @@ async def ocr(
         image_base64: a `data:image/...;base64,...` data URL.
         prompt: optional instruction override (default = full
             transcription).
-        agent_binding: injected by the platform (M-SEC-TOKEN-BINDING-1
-            second factor for the workspace-file broker) — do not set it.
+        agent_binding: injected by the platform (second factor for the
+            workspace-file broker) — do not set it.
 
     Returns:
         dict with `text` (the transcription) and `model`.
@@ -478,8 +494,8 @@ async def describe_image(
         prompt: optional specific question or instruction — pass the
             user's own question in the user's language to get the answer
             in that language.
-        agent_binding: injected by the platform (M-SEC-TOKEN-BINDING-1
-            second factor for the workspace-file broker) — do not set it.
+        agent_binding: injected by the platform (second factor for the
+            workspace-file broker) — do not set it.
 
     Returns:
         dict with `description` and `model`.
@@ -514,8 +530,8 @@ async def analyze_ui(
             skill uses). Use this OR image_url OR image_base64.
         image_url: http(s) URL of the screenshot.
         image_base64: a `data:image/...;base64,...` data URL.
-        agent_binding: injected by the platform (M-SEC-TOKEN-BINDING-1
-            second factor for the workspace-file broker) — do not set it.
+        agent_binding: injected by the platform (second factor for the
+            workspace-file broker) — do not set it.
 
     Returns:
         dict with `analysis` (Markdown report) and `model`.
@@ -557,8 +573,8 @@ async def compare_screenshots(
             Use this OR image2_url OR image2_base64.
         image2_url: http(s) URL of the changed screenshot.
         image2_base64: data-URL of the changed screenshot.
-        agent_binding: injected by the platform (M-SEC-TOKEN-BINDING-1
-            second factor for the workspace-file broker) — do not set it.
+        agent_binding: injected by the platform (second factor for the
+            workspace-file broker) — do not set it.
 
     Returns:
         dict with `diff` (Markdown report) and `model`.
@@ -583,6 +599,159 @@ async def compare_screenshots(
     return {"diff": diff_text, "model": _MULTIMODAL_ALIAS}
 
 
+async def _slice_mp3(mp3: bytes, start: float, duration: float) -> bytes:
+    """One piece of an already-normalised mp3, re-encoded so the cut lands
+    where it was asked for rather than on the nearest frame, with a short
+    silence in front of it.
+
+    The silence is not cosmetic. Measured against the shipped model: audio
+    whose first word begins at zero comes back with that whole first sentence
+    missing, and the same audio with a second of silence in front of it comes
+    back complete. Every cut produces exactly that -- a piece starting on a
+    word -- so without this the chunker would lose a sentence at every seam
+    and a lone voice note would lose its opening.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in.mp3")
+        dst = os.path.join(d, "part.mp3")
+        with open(src, "wb") as f:
+            f.write(mp3)
+        lead_ms = int(_CHUNK_LEAD_SILENCE_SECONDS * 1000)
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-ss", f"{start:.3f}", "-i", src,
+            "-t", f"{max(duration, 0.05):.3f}",
+            "-af", f"adelay={lead_ms}|{lead_ms}",
+            "-ac", "1", "-ar", "16000", dst,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg slice failed: {stderr.decode(errors='replace')[-400:]}"
+            )
+        with open(dst, "rb") as f:
+            return f.read()
+
+
+async def _transcribe_piece(
+    agent_id: str, mp3: bytes, duration: float, language: str | None, whole: bool
+) -> str:
+    """One model call for one piece of audio.
+
+    A piece that is not the whole recording says so in the prompt: without
+    that, a model handed an excerpt that starts mid-sentence tends to
+    apologise for the missing context instead of transcribing what it has.
+    """
+    hint = f" The audio is in {language}." if language else ""
+    if not whole:
+        hint += (
+            " This is an excerpt from a longer recording and may begin or end "
+            "mid-sentence; transcribe exactly what you hear and nothing else."
+        )
+    return await _multimodal(agent_id, [
+        {
+            "type": "text",
+            "text": "Transcribe this audio verbatim. Output only the "
+            "transcription, no commentary." + hint,
+        },
+        {
+            "type": "input_audio",
+            "input_audio": {
+                "data": base64.b64encode(mp3).decode("ascii"),
+                "format": "mp3",
+            },
+        },
+    ], max_tokens=transcription_token_budget(duration))
+
+
+async def iter_transcription(
+    agent_id: str,
+    raw: bytes,
+    language: str | None = None,
+    turns: list[chunker.Turn] | None = None,
+):
+    """Transcribe audio of any length, yielding each piece as it lands.
+
+    Pieces are transcribed concurrently but consumed in order, so a caller
+    streaming to a meeting driver gets correct text early instead of correct
+    text late: the first piece is a chunk long, not a recording long. Each
+    yielded mapping carries the piece's bounds, its own transcript, and the
+    delta it contributed to the assembled one after the seam was resolved.
+    """
+    mp3, duration = await _normalise_to_mp3(raw)
+    chunks = chunker.plan_chunks(duration, turns=turns)
+    limit = asyncio.Semaphore(max(1, _TRANSCRIBE_CONCURRENCY))
+    single = len(chunks) == 1
+
+    async def run(chunk: chunker.Chunk) -> str:
+        async with limit:
+            # A recording short enough to need no cut still goes through the
+            # slicer: what it gains there is the lead silence, without which
+            # its first sentence is the one the model drops.
+            piece = await _slice_mp3(mp3, chunk.start, chunk.duration)
+            return await _transcribe_piece(
+                agent_id, piece, chunk.duration, language, single
+            )
+
+    tasks = [asyncio.create_task(run(chunk)) for chunk in chunks]
+    stitcher = chunker.Stitcher()
+    try:
+        for chunk, task in zip(chunks, tasks):
+            text = await task
+            yield {
+                "index": chunk.index,
+                "start": chunk.start,
+                "end": chunk.end,
+                "text": text,
+                "delta": stitcher.add(chunk, text),
+                "assembled": stitcher.text,
+                "duration_seconds": duration,
+                "chunks": len(chunks),
+                "truncated": text.endswith(TRUNCATION_MARKER),
+            }
+    finally:
+        # A consumer that walks away — a disconnected stream, an exception —
+        # must not leave paid model calls running for a transcript nobody
+        # will read.
+        for task in tasks:
+            task.cancel()
+
+
+async def transcribe_audio(
+    agent_id: str,
+    raw: bytes,
+    language: str | None = None,
+    turns: list[chunker.Turn] | None = None,
+) -> dict[str, Any]:
+    """The whole transcript, assembled. Same path as the streaming form."""
+    segments: list[dict[str, Any]] = []
+    assembled = ""
+    duration = 0.0
+    truncated = False
+    async for piece in iter_transcription(agent_id, raw, language, turns):
+        # A segment carries what its chunk ADDED, not what its chunk heard:
+        # the two differ by the overlap, and a caller assembling the segments
+        # itself must get the transcript back rather than the transcript with
+        # every seam said twice.
+        segments.append({
+            "id": piece["index"],
+            "start": piece["start"],
+            "end": piece["end"],
+            "text": piece["delta"],
+        })
+        assembled = piece["assembled"]
+        duration = piece["duration_seconds"]
+        truncated = truncated or piece["truncated"]
+    return {
+        "text": assembled,
+        "model": _MULTIMODAL_ALIAS,
+        "truncated": truncated,
+        "duration_seconds": duration,
+        "segments": segments,
+    }
+
+
 @mcp.tool()
 async def transcribe(
     agent_id: str,
@@ -605,35 +774,26 @@ async def transcribe(
             (local files must use `path`, not a file:// URL).
         audio_base64: a base64 / data-URL audio payload.
         language: optional ISO hint (e.g. "it") to bias the model.
-        agent_binding: injected by the platform (M-SEC-TOKEN-BINDING-1
-            second factor for the workspace-file broker) — do not set it.
+        agent_binding: injected by the platform (second factor for the
+            workspace-file broker) — do not set it.
 
     Returns:
         dict with `text` (the transcription) and `model`.
     """
     if not agent_id:
         raise ValueError("agent_id is required (cannot be empty)")
-    mp3, duration = await _normalise_to_mp3(
-        await _load_audio_bytes(agent_id, path, audio_url, audio_base64, agent_binding)
+    raw = await _load_audio_bytes(
+        agent_id, path, audio_url, audio_base64, agent_binding
     )
-    b64 = base64.b64encode(mp3).decode("ascii")
-    hint = f" The audio is in {language}." if language else ""
-
-    text = await _multimodal(agent_id, [
-        {
-            "type": "text",
-            "text": "Transcribe this audio verbatim. Output only the "
-            "transcription, no commentary." + hint,
-        },
-        {"type": "input_audio", "input_audio": {"data": b64, "format": "mp3"}},
-    ], max_tokens=transcription_token_budget(duration))
+    result = await transcribe_audio(agent_id, raw, language)
     return {
-        "text": text,
-        "model": _MULTIMODAL_ALIAS,
-        # Explicit, so a caller can branch on it without matching the marker
-        # string. The marker stays in `text` as well, for the callers that
-        # only ever read that.
-        "truncated": text.endswith(TRUNCATION_MARKER),
+        "text": result["text"],
+        "model": result["model"],
+        # Explicit, so a caller can branch without matching the marker string.
+        # The marker stays in `text` too, for callers that only read that.
+        "truncated": result["truncated"],
+        "duration_seconds": result["duration_seconds"],
+        "chunks": len(result["segments"]),
     }
 
 
