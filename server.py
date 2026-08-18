@@ -117,6 +117,47 @@ def _safe_local_path(path: str) -> str:
 # M-SEC-SAFEFETCH-1 — cap on remote audio downloads (bytes).
 _MAX_FETCH_BYTES = int(os.environ.get("CERASE_FETCH_MAX_BYTES", 50 * 1024 * 1024))
 
+# Audio tokenises at a measured, content-independent 25 tokens per second
+# (90,000/hour), and speech transcribes to far fewer tokens than the audio
+# itself carries. 40 output tokens per second of audio is roughly 8x the
+# densest real speech, so it never truncates an honest transcript while still
+# bounding a runaway to a small multiple of the correct cost. The floor covers
+# clips too short for the rate to mean anything.
+_TRANSCRIBE_TOKENS_PER_AUDIO_SECOND = int(
+    os.environ.get("CERASE_TRANSCRIBE_TOKENS_PER_AUDIO_SECOND", 20)
+)
+_TRANSCRIBE_MIN_TOKENS = int(os.environ.get("CERASE_TRANSCRIBE_MIN_TOKENS", 512))
+# A per-second rate ALONE is not a ceiling, and the test that asserts this
+# caught it: at any generous rate an hour of audio computes a budget above the
+# model's own 65,535 limit, so the model's ceiling binds first and the runaway
+# is back. The hard cap is what makes the bound real on long input. It sits at
+# half the model ceiling -- roughly twice the densest hour of Italian speech,
+# so an honest transcript never reaches it, while a runaway costs half of what
+# it did. Long audio should not arrive here in one payload at all; that is
+# M-TRANSCRIPTION-CHUNKER-1, and this is the floor under it until then.
+_TRANSCRIBE_MAX_TOKENS = int(os.environ.get("CERASE_TRANSCRIBE_MAX_TOKENS", 32_768))
+
+TRUNCATION_MARKER = "\n\n[transcription truncated: output ceiling reached]"
+
+
+def transcription_token_budget(duration_seconds: float) -> int:
+    """The output ceiling for an audio payload of this duration.
+
+    Public and pure so a test can exercise THIS rule rather than a copy of it:
+    reaching `transcribe` needs a model, a gateway and an agent, and a test
+    that re-implemented the arithmetic would keep passing after the arithmetic
+    changed.
+    """
+    if duration_seconds <= 0:
+        return _TRANSCRIBE_MIN_TOKENS
+    return min(
+        _TRANSCRIBE_MAX_TOKENS,
+        max(
+            _TRANSCRIBE_MIN_TOKENS,
+            int(duration_seconds * _TRANSCRIBE_TOKENS_PER_AUDIO_SECOND),
+        ),
+    )
+
 
 def _validate_fetch_url(url: str) -> str:
     """M-SEC-SAFEFETCH-1 — SSRF/LFI guard for a caller-supplied fetch URL.
@@ -294,9 +335,16 @@ async def _load_audio_bytes(
     return base64.b64decode(payload)
 
 
-async def _normalise_to_mp3(raw: bytes) -> bytes:
+async def _normalise_to_mp3(raw: bytes) -> tuple[bytes, float]:
     """Transcode arbitrary audio to mono 16k mp3 via ffmpeg (async
-    subprocess — a long transcode never blocks the other lanes)."""
+    subprocess — a long transcode never blocks the other lanes).
+
+    Returns the bytes AND the duration in seconds, because the caller needs
+    the duration to bound the output and asking ffprobe separately would
+    decode the same file twice. A duration ffprobe cannot determine comes back
+    as 0.0 and the caller falls back to its floor, rather than the transcode
+    failing over a number that is only used for a ceiling.
+    """
     with tempfile.TemporaryDirectory() as d:
         src = os.path.join(d, "in")
         dst = os.path.join(d, "out.mp3")
@@ -311,17 +359,60 @@ async def _normalise_to_mp3(raw: bytes) -> bytes:
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg failed: {stderr.decode(errors='replace')[-400:]}")
         with open(dst, "rb") as f:
-            return f.read()
+            data = f.read()
+        return data, await _duration_seconds(dst)
 
 
-async def _multimodal(agent_id: str, content: list[dict[str, Any]]) -> str:
-    """One multimodal call, billed to the calling agent."""
+async def _duration_seconds(path: str) -> float:
+    """Audio duration via ffprobe, or 0.0 when it cannot be determined."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return 0.0
+        return float(out.decode().strip())
+    except (ValueError, OSError):
+        return 0.0
+
+
+async def _multimodal(
+    agent_id: str, content: list[dict[str, Any]], max_tokens: int | None = None
+) -> str:
+    """One multimodal call, billed to the calling agent.
+
+    `max_tokens` is a COST CEILING, not a quality setting. Without it a
+    transcription can run away: measured 2026-08-18 against the running
+    appliance, three audio files of five, thirty and forty-five minutes each
+    came back at the model's own 65,535-token ceiling, and on the longest one
+    the output was 56% of the call's cost -- a five-minute voice note billed
+    58x a one-minute one. Callers that can bound their output pass a bound;
+    callers that cannot (OCR, image description) pass None and keep the
+    previous behaviour, because their input is inherently small.
+    """
+    kwargs: dict[str, Any] = {}
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
     resp = await _client().chat.completions.create(
         model=_MULTIMODAL_ALIAS,
         messages=[{"role": "user", "content": content}],
         extra_body={"metadata": {"cerase_agent_id": agent_id}},
+        **kwargs,
     )
-    return (resp.choices[0].message.content if resp.choices else "") or ""
+    if not resp.choices:
+        return ""
+    text = resp.choices[0].message.content or ""
+    # A ceiling that silently truncates is worse than no ceiling: the caller
+    # gets a transcript that LOOKS whole and is not. The marker is appended to
+    # the text rather than returned beside it so that every consumer sees it --
+    # a separate field is one an existing caller would not read.
+    if getattr(resp.choices[0], "finish_reason", None) == "length":
+        text += TRUNCATION_MARKER
+    return text
 
 
 @mcp.tool()
@@ -522,7 +613,7 @@ async def transcribe(
     """
     if not agent_id:
         raise ValueError("agent_id is required (cannot be empty)")
-    mp3 = await _normalise_to_mp3(
+    mp3, duration = await _normalise_to_mp3(
         await _load_audio_bytes(agent_id, path, audio_url, audio_base64, agent_binding)
     )
     b64 = base64.b64encode(mp3).decode("ascii")
@@ -535,8 +626,15 @@ async def transcribe(
             "transcription, no commentary." + hint,
         },
         {"type": "input_audio", "input_audio": {"data": b64, "format": "mp3"}},
-    ])
-    return {"text": text, "model": _MULTIMODAL_ALIAS}
+    ], max_tokens=transcription_token_budget(duration))
+    return {
+        "text": text,
+        "model": _MULTIMODAL_ALIAS,
+        # Explicit, so a caller can branch on it without matching the marker
+        # string. The marker stays in `text` as well, for the callers that
+        # only ever read that.
+        "truncated": text.endswith(TRUNCATION_MARKER),
+    }
 
 
 if __name__ == "__main__":
