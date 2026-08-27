@@ -20,6 +20,10 @@ Tools:
       → {diff, model} — visual diff between two screenshots.
   - transcribe(agent_id, path?, audio_url?, audio_base64?, language?)
       → {text, model} — audio → text (ffmpeg-normalised to mono 16k mp3).
+  - meeting_normalise(source_url, destination_url, declared_seconds?)
+      → {decoded_seconds, declared_seconds, bytes, degraded, degraded_reason}
+      — measures a meeting recording by DECODING it, normalises it to
+      mono 16 kHz Opus and puts it back through a presigned URL.
 
 Exactly one source argument must be supplied per call. `agent_id` is
 bound by the gateway (same pattern as cerase-memory's user_id).
@@ -795,6 +799,186 @@ async def transcribe(
         "duration_seconds": result["duration_seconds"],
         "chunks": len(result["segments"]),
     }
+
+
+# ---------------------------------------------------------------------------
+# Meeting ingestion — the artefact is measured, never believed
+# ---------------------------------------------------------------------------
+
+# How much of a meeting's audio is decoded to measure it. A file this long is
+# already far past any real call, and the ceiling is here so a malformed or
+# hostile object cannot hold a worker for ever.
+_MAX_MEETING_SECONDS = float(os.environ.get("CERASE_MEETING_MAX_SECONDS", "36000"))
+
+# Below this share of the declared length the recording is degraded rather than
+# short. Measured: a driver reported an 85-second Teams call whose audio ended
+# at 6,3 s -- 7% -- having patched the container metadata to claim the full
+# duration and logged "completed successfully" twice.
+_MEETING_MIN_RATIO = float(os.environ.get("CERASE_MEETING_MIN_RATIO", "0.9"))
+
+
+async def _decoded_seconds(path: str) -> float:
+    """How much audio ffmpeg can actually DECODE out of this file.
+
+    Not ffprobe. `format.duration` is metadata, and metadata is exactly what a
+    capture driver rewrites when it patches a truncated file to claim the full
+    call -- so a check that reads it agrees with the driver about a recording
+    that stops 93% early. Decoding to /dev/null reads every frame and reports
+    where the audio actually ends.
+
+    `-progress pipe:1` is parsed instead of the human log: the progress stream
+    is key=value on stdout and ends with `progress=end`, where the timestamp in
+    the log line is formatted for a person and has moved between ffmpeg
+    releases.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-nostdin", "-v", "error", "-progress", "pipe:1",
+        "-i", path, "-map", "0:a:0?", "-f", "null", "-",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return 0.0
+    last = 0.0
+    for line in out.decode(errors="replace").splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() != "out_time_us":
+            continue
+        try:
+            micros = float(value.strip())
+        except ValueError:
+            continue   # ffmpeg writes N/A before the first frame lands
+        if micros > 0:
+            last = micros / 1_000_000
+    return last
+
+
+async def _to_meeting_opus(src: str, dst: str) -> None:
+    """Mono 16 kHz Opus in Ogg -- one shape, whatever the driver sent.
+
+    Two drivers on three platforms produce three encodings: Meet and Zoom
+    record through MediaRecorder into WebM, Teams through ffmpeg on the X11
+    display. Everything downstream -- the chunker's 120-second window, the
+    playback URL, the retention arithmetic -- is written against one of them,
+    so the normalisation happens once, here, rather than being a branch in each
+    of them.
+
+    A probe of the result reports 48000 Hz whatever is passed here: Opus is
+    defined to decode at 48 kHz, and the rate the encoder was fed is recorded
+    in the OpusHead instead. So the 16 kHz is a property of the encode, read
+    from that header and not from the place a reader would first look.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-nostdin", "-y", "-v", "error", "-i", src,
+        "-map", "0:a:0", "-ac", "1", "-ar", "16000",
+        "-c:a", "libopus", "-b:a", "16k", "-application", "voip",
+        "-f", "ogg", dst,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ffmpeg could not normalise the recording: "
+            f"{stderr.decode(errors='replace')[-400:]}"
+        )
+
+
+@mcp.tool()
+async def meeting_normalise(
+    source_url: str,
+    destination_url: str,
+    declared_seconds: float = 0.0,
+) -> dict[str, Any]:
+    """Measure a meeting recording, normalise it, and put it back.
+
+    Both URLs are presigned and expiring: the caller holds the object-store
+    credential and this container never does. The source is fetched, decoded to
+    find out how much audio is really in it, transcoded to mono 16 kHz Opus and
+    PUT to the destination.
+
+    Args:
+        source_url: presigned GET for the object the capture driver uploaded.
+        destination_url: presigned PUT for the normalised audio.
+        declared_seconds: how long the driver said the meeting was. Compared
+            against the decoded length; 0 means it did not say.
+
+    Returns: dict with `decoded_seconds`, `declared_seconds`, `bytes`,
+        `degraded` and `degraded_reason`.
+    """
+    _validate_fetch_url(source_url)
+    _validate_fetch_url(destination_url)
+
+    import httpx
+
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "source")
+        dst = os.path.join(d, "meeting.ogg")
+
+        total = 0
+        async with httpx.AsyncClient(timeout=600) as client:
+            async with client.stream("GET", source_url) as resp:
+                resp.raise_for_status()
+                with open(src, "wb") as f:
+                    async for chunk in resp.aiter_bytes():
+                        total += len(chunk)
+                        if total > _MAX_FETCH_BYTES:
+                            raise ValueError(
+                                f"the recording exceeds the {_MAX_FETCH_BYTES}-byte limit"
+                            )
+                        f.write(chunk)
+        if total == 0:
+            raise ValueError("the recording is empty — nothing was captured")
+
+        decoded = await _decoded_seconds(src)
+        if decoded > _MAX_MEETING_SECONDS:
+            raise ValueError(
+                f"the recording decodes {decoded:.0f}s, past the "
+                f"{_MAX_MEETING_SECONDS:.0f}s ceiling"
+            )
+        if decoded <= 0:
+            raise ValueError("no audio could be decoded out of the recording")
+
+        await _to_meeting_opus(src, dst)
+        out_bytes = os.path.getsize(dst)
+
+        async with httpx.AsyncClient(timeout=600) as client:
+            with open(dst, "rb") as f:
+                put = await client.put(
+                    destination_url,
+                    content=f.read(),
+                    headers={"Content-Type": "audio/ogg"},
+                )
+            put.raise_for_status()
+
+    degraded, reason = _meeting_degradation(declared_seconds, decoded)
+    return {
+        "decoded_seconds": round(decoded, 3),
+        "declared_seconds": round(float(declared_seconds), 3),
+        "bytes": out_bytes,
+        "degraded": degraded,
+        "degraded_reason": reason,
+    }
+
+
+def _meeting_degradation(declared: float, decoded: float) -> tuple[bool, str]:
+    """Whether the decoded audio is short of what the driver claimed.
+
+    A driver that says nothing about the length gets the benefit of it: the
+    comparison is the check, and inventing a declared duration would turn every
+    such recording into a false alarm.
+    """
+    declared = float(declared or 0.0)
+    if declared <= 0:
+        return False, ""
+    ratio = decoded / declared
+    if ratio >= _MEETING_MIN_RATIO:
+        return False, ""
+    return True, (
+        f"the driver reported {declared:.0f}s and the file decodes "
+        f"{decoded:.1f}s — {ratio * 100:.0f}% of the meeting"
+    )
 
 
 if __name__ == "__main__":
