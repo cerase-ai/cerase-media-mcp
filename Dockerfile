@@ -3,7 +3,7 @@
 # M-MEDIA-1: the merge of cerase-ocr + cerase-transcriber, ASYNC tools so
 # concurrent requests ride parallel I/O lanes in one container.
 #
-# Exposes 3 tools: ocr, describe_image, transcribe. FastMCP stdio bridged
+# Exposes 3 tools: ocr, describe_image, transcribe. MCPServer stdio bridged
 # by mcp-proxy — same shape as the other cerase-* MCP images.
 FROM python:3.13.9-slim@sha256:326df678c20c78d465db501563f3492d17c42a4afe33a1f2bf5406a1d56b0e86
 

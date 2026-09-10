@@ -46,7 +46,7 @@ import tempfile
 from typing import Any
 from urllib.parse import urlparse
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 import chunker
 
@@ -58,7 +58,7 @@ import chunker
 logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-mcp = FastMCP("cerase-media")
+mcp = MCPServer("cerase-media")
 
 _MULTIMODAL_ALIAS = os.environ.get("CERASE_MULTIMODAL_ALIAS", "multimodal")
 
