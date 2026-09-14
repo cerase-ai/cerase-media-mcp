@@ -3,13 +3,20 @@
 # M-MEDIA-1: the merge of cerase-ocr + cerase-transcriber, ASYNC tools so
 # concurrent requests ride parallel I/O lanes in one container.
 #
-# Exposes 3 tools: ocr, describe_image, transcribe. MCPServer stdio bridged
+# Exposes 3 tools: ocr, describe_image, transcribe. FastMCP stdio bridged
 # by mcp-proxy — same shape as the other cerase-* MCP images.
-FROM python:3.13.9-slim@sha256:326df678c20c78d465db501563f3492d17c42a4afe33a1f2bf5406a1d56b0e86
+FROM python:3.13.9-slim@sha256:326df678c20c78d465db501563f3492d17c42a4afe33a1f2bf5406a1d56b0e86 AS runtime
 
 # ffmpeg transcodes arbitrary uploaded audio to a compact mono 16k mp3
 # before it goes upstream.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# The digest-pinned base lags Debian's security feed, so this stage applies the
+# published security upgrades before installing anything. The publish job's
+# blocking image scan holds the image to that, and it can only do so because its
+# scan build rebuilds the stage named `runtime` without the layer cache: a cached
+# apt layer keeps the packages of whichever day it was first built.
+RUN apt-get update && apt-get -y upgrade \
+    && apt-get install -y --no-install-recommends \
         ca-certificates \
         ffmpeg \
     && rm -rf /var/lib/apt/lists/*

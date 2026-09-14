@@ -22,16 +22,14 @@ import types
 import unittest
 from unittest import mock
 
-# --- stub `mcp.server.mcpserver` so `import server` needs no MCP deps -------
+# --- stub `mcp.server.fastmcp` so `import server` needs no MCP deps -------
 #
-# The stubbed `mcp.server` must be a PACKAGE, not a plain module. It used to be
-# a module and that was invisible while the import was one level deep
-# (`mcp.server.fastmcp` was set directly in sys.modules); migrating to
-# `mcp.server.mcpserver` made Python resolve the middle name itself, and it
-# answered "'mcp.server' is not a package" — a stub failing on the shape it had
-# always had, on the day the real import moved.
-if "mcp.server.mcpserver" not in sys.modules:
-    class _MCPServer:
+# The stubbed `mcp` and `mcp.server` are PACKAGES, not plain modules: a plain
+# module works only while every import names a key set directly in sys.modules,
+# and Python answers "'mcp.server' is not a package" the moment it has to
+# resolve a middle name itself.
+if "mcp.server.fastmcp" not in sys.modules:
+    class _FastMCP:
         def __init__(self, *args, **kwargs):
             pass
 
@@ -44,15 +42,15 @@ if "mcp.server.mcpserver" not in sys.modules:
         def run(self, *args, **kwargs):
             pass
 
-    _mcpserver = types.ModuleType("mcp.server.mcpserver")
-    _mcpserver.MCPServer = _MCPServer
+    _fastmcp = types.ModuleType("mcp.server.fastmcp")
+    _fastmcp.FastMCP = _FastMCP
     _mcp_server = types.ModuleType("mcp.server")
-    _mcp_server.__path__ = []          # un pacchetto, o il nome di mezzo non risolve
+    _mcp_server.__path__ = []
     _mcp = types.ModuleType("mcp")
     _mcp.__path__ = []
     sys.modules.setdefault("mcp", _mcp)
     sys.modules.setdefault("mcp.server", _mcp_server)
-    sys.modules["mcp.server.mcpserver"] = _mcpserver
+    sys.modules["mcp.server.fastmcp"] = _fastmcp
 
 import chunker  # noqa: E402
 import server  # noqa: E402

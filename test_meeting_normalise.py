@@ -22,12 +22,14 @@ import tempfile
 import types
 import unittest
 
-# Lo `mcp.server` finto dev'essere un PACCHETTO, non un modulo semplice: con
-# l'import a un solo livello il difetto era invisibile, e migrando a
-# `mcp.server.mcpserver` Python risolve il nome di mezzo da solo e risponde
-# «'mcp.server' is not a package».
-if "mcp.server.mcpserver" not in sys.modules:
-    class _MCPServer:
+# --- stub `mcp.server.fastmcp` so `import server` needs no MCP deps -------
+#
+# The stubbed `mcp` and `mcp.server` are PACKAGES, not plain modules: a plain
+# module works only while every import names a key set directly in sys.modules,
+# and Python answers "'mcp.server' is not a package" the moment it has to
+# resolve a middle name itself.
+if "mcp.server.fastmcp" not in sys.modules:
+    class _FastMCP:
         def __init__(self, *args, **kwargs):
             pass
 
@@ -40,15 +42,15 @@ if "mcp.server.mcpserver" not in sys.modules:
         def run(self, *args, **kwargs):
             pass
 
-    _mcpserver = types.ModuleType("mcp.server.mcpserver")
-    _mcpserver.MCPServer = _MCPServer
+    _fastmcp = types.ModuleType("mcp.server.fastmcp")
+    _fastmcp.FastMCP = _FastMCP
     _mcp_server = types.ModuleType("mcp.server")
     _mcp_server.__path__ = []
     _mcp = types.ModuleType("mcp")
     _mcp.__path__ = []
     sys.modules.setdefault("mcp", _mcp)
     sys.modules.setdefault("mcp.server", _mcp_server)
-    sys.modules["mcp.server.mcpserver"] = _mcpserver
+    sys.modules["mcp.server.fastmcp"] = _fastmcp
 
 import server  # noqa: E402
 
