@@ -16,4 +16,5 @@ venv/
 test_*.py
 *_test.py
 conftest.py
+chunker-speech.txt
 README.md

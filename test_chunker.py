@@ -21,11 +21,10 @@ import unittest
 import chunker
 from chunker import Chunk, Turn
 
+# The passage sits beside this file, so the suite runs on a checkout of this
+# connector alone as well as inside the repository that builds it.
 _PASSAGE = open(
-    os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-        "tests", "live", "fixtures", "chunker-speech.txt",
-    ),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "chunker-speech.txt"),
     encoding="utf-8",
 ).read().split()
 
