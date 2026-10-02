@@ -447,20 +447,15 @@ async def ocr(
 ) -> dict[str, Any]:
     """Extract the TEXT written in an image via a vision LLM.
 
-    Use when the user wants what is WRITTEN in an uploaded scan / photo /
-    screenshot ("cosa c'è scritto in questa immagine?"). To know what the
-    picture SHOWS instead, use `describe_image`.
+    Use when the user wants what is WRITTEN in an uploaded scan / photo / screenshot ("cosa c'è scritto in questa immagine?"). To know what the picture SHOWS instead, use `describe_image`.
 
     Args:
         agent_id: Cerase Agent PK — bound by the gateway. Required.
-        path: workspace file path (the form the attachment-receiver
-            skill uses). Use this OR image_url OR image_base64.
+        path: workspace file path (the form the attachment-receiver skill uses). Use this OR image_url OR image_base64.
         image_url: http(s) URL of the image.
         image_base64: a `data:image/...;base64,...` data URL.
-        prompt: optional instruction override (default = full
-            transcription).
-        agent_binding: injected by the platform (second factor for the
-            workspace-file broker) — do not set it.
+        prompt: optional instruction override (default = full transcription).
+        agent_binding: injected by the platform (second factor for the workspace-file broker) — do not set it.
 
     Returns:
         dict with `text` (the transcription) and `model`.
@@ -486,21 +481,15 @@ async def describe_image(
 ) -> dict[str, Any]:
     """Describe what is VISIBLE in an image via a vision LLM.
 
-    Use when the user wants to know what a picture SHOWS — scene, objects,
-    people, context ("cosa si vede / cosa è raffigurato in questa foto?").
-    To extract the written text verbatim, use `ocr` instead.
+    Use when the user wants to know what a picture SHOWS — scene, objects, people, context ("cosa si vede / cosa è raffigurato in questa foto?"). To extract the written text verbatim, use `ocr` instead.
 
     Args:
         agent_id: Cerase Agent PK — bound by the gateway. Required.
-        path: workspace file path (the form the attachment-receiver
-            skill uses). Use this OR image_url OR image_base64.
+        path: workspace file path (the form the attachment-receiver skill uses). Use this OR image_url OR image_base64.
         image_url: http(s) URL of the image.
         image_base64: a `data:image/...;base64,...` data URL.
-        prompt: optional specific question or instruction — pass the
-            user's own question in the user's language to get the answer
-            in that language.
-        agent_binding: injected by the platform (second factor for the
-            workspace-file broker) — do not set it.
+        prompt: optional specific question or instruction — pass the user's own question in the user's language to get the answer in that language.
+        agent_binding: injected by the platform (second factor for the workspace-file broker) — do not set it.
 
     Returns:
         dict with `description` and `model`.
@@ -525,18 +514,14 @@ async def analyze_ui(
 ) -> dict[str, Any]:
     """Analyze a UI screenshot and return a structured UX/UI audit.
 
-    Returns a detailed report covering layout, typography, colors,
-    interactive elements, text content, visual errors, accessibility,
-    and consistency.
+    Returns a detailed report covering layout, typography, colors, interactive elements, text content, visual errors, accessibility, and consistency.
 
     Args:
         agent_id: Cerase Agent PK — bound by the gateway. Required.
-        path: workspace file path (the form the attachment-receiver
-            skill uses). Use this OR image_url OR image_base64.
+        path: workspace file path (the form the attachment-receiver skill uses). Use this OR image_url OR image_base64.
         image_url: http(s) URL of the screenshot.
         image_base64: a `data:image/...;base64,...` data URL.
-        agent_binding: injected by the platform (second factor for the
-            workspace-file broker) — do not set it.
+        agent_binding: injected by the platform (second factor for the workspace-file broker) — do not set it.
 
     Returns:
         dict with `analysis` (Markdown report) and `model`.
@@ -564,22 +549,17 @@ async def compare_screenshots(
 ) -> dict[str, Any]:
     """Compare two UI screenshots and report visual differences.
 
-    Image 1 is the BEFORE (baseline), Image 2 is the AFTER (changed).
-    Returns a structured diff covering layout, text, colors, new/removed
-    elements, and regressions.
+    Image 1 is the BEFORE (baseline), Image 2 is the AFTER (changed). Returns a structured diff covering layout, text, colors, new/removed elements, and regressions.
 
     Args:
         agent_id: Cerase Agent PK — bound by the gateway. Required.
-        path1: workspace file path for the baseline screenshot.
-            Use this OR image1_url OR image1_base64.
+        path1: workspace file path for the baseline screenshot. Use this OR image1_url OR image1_base64.
         image1_url: http(s) URL of the baseline screenshot.
         image1_base64: data-URL of the baseline screenshot.
-        path2: workspace file path for the changed screenshot.
-            Use this OR image2_url OR image2_base64.
+        path2: workspace file path for the changed screenshot. Use this OR image2_url OR image2_base64.
         image2_url: http(s) URL of the changed screenshot.
         image2_base64: data-URL of the changed screenshot.
-        agent_binding: injected by the platform (second factor for the
-            workspace-file broker) — do not set it.
+        agent_binding: injected by the platform (second factor for the workspace-file broker) — do not set it.
 
     Returns:
         dict with `diff` (Markdown report) and `model`.
@@ -768,19 +748,15 @@ async def transcribe(
 ) -> dict[str, Any]:
     """Transcribe an audio file to text via a multimodal LLM.
 
-    Use when the user sends a voice note / audio recording and wants it
-    in text, or asks "cosa dice questo audio?".
+    Use when the user sends a voice note / audio recording and wants it in text, or asks "cosa dice questo audio?".
 
     Args:
         agent_id: Cerase Agent PK — bound by the gateway. Required.
-        path: workspace file path (the form the attachment-receiver
-            skill uses). Use this OR audio_url OR audio_base64.
-        audio_url: http(s) URL of the audio — public remote hosts only
-            (local files must use `path`, not a file:// URL).
+        path: workspace file path (the form the attachment-receiver skill uses). Use this OR audio_url OR audio_base64.
+        audio_url: http(s) URL of the audio — public remote hosts only (local files must use `path`, not a file:// URL).
         audio_base64: a base64 / data-URL audio payload.
         language: optional ISO hint (e.g. "it") to bias the model.
-        agent_binding: injected by the platform (second factor for the
-            workspace-file broker) — do not set it.
+        agent_binding: injected by the platform (second factor for the workspace-file broker) — do not set it.
 
     Returns:
         dict with `text` (the transcription) and `model`.
@@ -948,21 +924,14 @@ async def meeting_normalise(
 ) -> dict[str, Any]:
     """Measure a meeting recording, normalise it, and put it back.
 
-    Both URLs are presigned and expiring: the caller holds the object-store
-    credential and this container never does. The source is fetched, decoded to
-    find out how much audio is really in it and how loud its loudest
-    half-second is, transcoded to mono 16 kHz Opus and PUT to the destination.
+    Both URLs are presigned and expiring: the caller holds the object-store credential and this container never does. The source is fetched, decoded to find out how much audio is really in it and how loud its loudest half-second is, transcoded to mono 16 kHz Opus and PUT to the destination.
 
     Args:
         source_url: presigned GET for the object the capture driver uploaded.
         destination_url: presigned PUT for the normalised audio.
-        declared_seconds: how long the driver said the meeting was. Compared
-            against the decoded length; 0 means it did not say.
+        declared_seconds: how long the driver said the meeting was. Compared against the decoded length; 0 means it did not say.
 
-    Returns: dict with `decoded_seconds`, `declared_seconds`, `bytes`,
-        `degraded`, `degraded_reason`, `loudest_db` (dBFS, None when no
-        sample is above zero) and `silent`, true when the loudest half-second
-        is under `_MEETING_SILENCE_DB`: nothing in it to transcribe.
+    Returns: dict with `decoded_seconds`, `declared_seconds`, `bytes`, `degraded`, `degraded_reason`, `loudest_db` (dBFS, None when no sample is above zero) and `silent`, true when the loudest half-second is under `_MEETING_SILENCE_DB`: nothing in it to transcribe.
     """
     _validate_fetch_url(source_url)
     _validate_fetch_url(destination_url)
