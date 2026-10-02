@@ -203,6 +203,67 @@ class Normalisation(unittest.TestCase):
                 asyncio.run(server._to_meeting_opus(src, dst))
 
 
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
+
+class Silence(unittest.TestCase):
+    """A recording with no sound in it is never transcribed.
+
+    A Meet capture recorded 490 s of silence, and its transcript came back as
+    English sentences nobody said. The three fixtures are recordings: the
+    silence as Chrome's MediaRecorder encodes it, which is what that capture
+    uploaded; the test sentence as the bot uploads it from Chrome's output; and
+    the same sentence 45 dB quieter, which is still a person speaking.
+    """
+
+    def setUp(self):
+        _ffmpeg_or_fail()
+
+    def loudest(self, name: str):
+        return asyncio.run(server._loudest_db(os.path.join(FIXTURES, name)))
+
+    def test_a_recording_of_silence_has_no_level_and_is_silent(self):
+        loudest = self.loudest("meeting-silent.webm")
+        self.assertIsNone(loudest)
+        self.assertTrue(server._meeting_is_silent(loudest))
+
+    def test_speech_is_far_above_the_line(self):
+        loudest = self.loudest("meeting-speech.webm")
+        self.assertGreater(loudest, -20)
+        self.assertFalse(server._meeting_is_silent(loudest))
+
+    def test_quiet_speech_is_still_not_silent(self):
+        loudest = self.loudest("meeting-quiet-speech.webm")
+        self.assertGreater(loudest, -60)
+        self.assertFalse(server._meeting_is_silent(loudest))
+
+    def test_one_sentence_in_a_long_silence_is_sound(self):
+        # The loudest half-second decides, not the average: a meeting that is
+        # quiet but for one sentence is a meeting.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "mostly-silent.webm")
+            subprocess.run(
+                ["ffmpeg", "-nostdin", "-v", "error",
+                 "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono:d=60",
+                 "-i", os.path.join(FIXTURES, "meeting-quiet-speech.webm"),
+                 "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1",
+                 "-c:a", "libopus", "-b:a", "32k", "-y", path],
+                check=True,
+            )
+            loudest = asyncio.run(server._loudest_db(path))
+        self.assertFalse(server._meeting_is_silent(loudest))
+
+    def test_a_file_that_is_not_audio_has_no_level(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "not-audio")
+            with open(path, "wb") as f:
+                f.write(b"this is not a recording")
+            self.assertIsNone(asyncio.run(server._loudest_db(path)))
+
+    def test_the_line_is_below_the_quietest_speech_measured(self):
+        self.assertLess(server._MEETING_SILENCE_DB, self.loudest("meeting-quiet-speech.webm") - 10)
+
+
 class BothUrlsAreGuarded(unittest.TestCase):
     """The DESTINATION is new attack surface, and it is a fetch too.
 

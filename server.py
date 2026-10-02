@@ -21,7 +21,8 @@ Tools:
   - transcribe(agent_id, path?, audio_url?, audio_base64?, language?)
       → {text, model} — audio → text (ffmpeg-normalised to mono 16k mp3).
   - meeting_normalise(source_url, destination_url, declared_seconds?)
-      → {decoded_seconds, declared_seconds, bytes, degraded, degraded_reason}
+      → {decoded_seconds, declared_seconds, bytes, degraded, degraded_reason,
+         loudest_db, silent}
       — measures a meeting recording by DECODING it, normalises it to
       mono 16 kHz Opus and puts it back through a presigned URL.
 
@@ -816,6 +817,15 @@ _MAX_MEETING_SECONDS = float(os.environ.get("CERASE_MEETING_MAX_SECONDS", "36000
 # duration and logged "completed successfully" twice.
 _MEETING_MIN_RATIO = float(os.environ.get("CERASE_MEETING_MIN_RATIO", "0.9"))
 
+# A recording whose loudest half-second stays below this level holds no sound to
+# transcribe, and a transcript of it is text nobody said: a Meet capture that
+# recorded silence for 490 s came back as invented English. Measured with
+# `_loudest_db`: that kind of recording has no sample above zero at all; the
+# test sentence as the bot uploads it reads -11.4 dBFS, the same 30 dB quieter
+# -41.4, 45 dB quieter -56.9. So the line sits at -70, 13 dB under the quietest
+# of them. Hiss is not silence: white noise at -63.5 is above it.
+_MEETING_SILENCE_DB = float(os.environ.get("CERASE_MEETING_SILENCE_DB", "-70"))
+
 
 async def _decoded_seconds(path: str) -> float:
     """How much audio ffmpeg can actually DECODE out of this file.
@@ -852,6 +862,51 @@ async def _decoded_seconds(path: str) -> float:
         if micros > 0:
             last = micros / 1_000_000
     return last
+
+
+async def _loudest_db(path: str) -> float | None:
+    """The RMS level of the loudest half-second of the recording, in dBFS.
+
+    None when not one sample in it is above zero, or when nothing could be
+    decoded. A half-second rather than the whole file, because a meeting that
+    is mostly quiet is still a meeting: one sentence in an hour has to read as
+    sound. A level rather than a peak, because a single click is not speech.
+
+    `astats` is reset every frame and the frames are cut to half a second at
+    16 kHz; `ametadata` writes each frame's level to a file, which is parsed,
+    rather than the human log.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        levels = os.path.join(d, "levels.txt")
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", "0:a:0?",
+            "-af", "aresample=16000,asetnsamples=n=8000:p=0,astats=metadata=1:reset=1,"
+                   f"ametadata=mode=print:key=lavfi.astats.Overall.RMS_level:file={levels}",
+            "-f", "null", "-",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        if proc.returncode != 0 or not os.path.exists(levels):
+            return None
+        loudest: float | None = None
+        with open(levels, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                key, _, value = line.strip().partition("=")
+                if key != "lavfi.astats.Overall.RMS_level":
+                    continue
+                try:
+                    level = float(value)
+                except ValueError:
+                    continue
+                if level != float("-inf") and (loudest is None or level > loudest):
+                    loudest = level
+        return loudest
+
+
+def _meeting_is_silent(loudest_db: float | None) -> bool:
+    """Whether a recording holds no sound to transcribe, from its loudest half-second."""
+    return loudest_db is None or loudest_db < _MEETING_SILENCE_DB
 
 
 async def _to_meeting_opus(src: str, dst: str) -> None:
@@ -895,8 +950,8 @@ async def meeting_normalise(
 
     Both URLs are presigned and expiring: the caller holds the object-store
     credential and this container never does. The source is fetched, decoded to
-    find out how much audio is really in it, transcoded to mono 16 kHz Opus and
-    PUT to the destination.
+    find out how much audio is really in it and how loud its loudest
+    half-second is, transcoded to mono 16 kHz Opus and PUT to the destination.
 
     Args:
         source_url: presigned GET for the object the capture driver uploaded.
@@ -905,7 +960,9 @@ async def meeting_normalise(
             against the decoded length; 0 means it did not say.
 
     Returns: dict with `decoded_seconds`, `declared_seconds`, `bytes`,
-        `degraded` and `degraded_reason`.
+        `degraded`, `degraded_reason`, `loudest_db` (dBFS, None when no
+        sample is above zero) and `silent`, true when the loudest half-second
+        is under `_MEETING_SILENCE_DB`: nothing in it to transcribe.
     """
     _validate_fetch_url(source_url)
     _validate_fetch_url(destination_url)
@@ -940,6 +997,8 @@ async def meeting_normalise(
         if decoded <= 0:
             raise ValueError("no audio could be decoded out of the recording")
 
+        loudest = await _loudest_db(src)
+
         await _to_meeting_opus(src, dst)
         out_bytes = os.path.getsize(dst)
 
@@ -959,6 +1018,8 @@ async def meeting_normalise(
         "bytes": out_bytes,
         "degraded": degraded,
         "degraded_reason": reason,
+        "loudest_db": None if loudest is None else round(loudest, 1),
+        "silent": _meeting_is_silent(loudest),
     }
 
 
