@@ -90,7 +90,7 @@ _ANALYZE_UI_PROMPT = (
     "overflow, truncated text, missing content areas.\n"
     "7. **Accessibility** — contrast violations, missing focus indicators, "
     "small touch targets, missing alt text indicators.\n"
-    "8. **Consistency** — repeated patterns, style deviations.\n"
+    "8. **Consistency** — repeated patterns, style deviations.\n\n"
     "Be concrete: reference specific elements by position or label. "
     "Output in Markdown with clear section headings."
 )
@@ -104,7 +104,7 @@ _COMPARE_SCREENSHOTS_PROMPT = (
     "3. **Color/style changes** — background, border, font changes.\n"
     "4. **New elements** — buttons, inputs, images that appeared.\n"
     "5. **Removed elements** — elements present in Image 1 but absent in Image 2.\n"
-    "6. **Regressions** — broken layouts, overflow, misalignment introduced.\n"
+    "6. **Regressions** — broken layouts, overflow, misalignment introduced.\n\n"
     "Be precise: describe the location of each change. "
     "If the two images look identical, state 'No visual differences detected.' "
     "Output in Markdown with clear section headings."
