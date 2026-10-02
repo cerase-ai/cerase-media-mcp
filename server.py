@@ -121,8 +121,11 @@ def _safe_local_path(path: str) -> str:
     return resolved
 
 
-# Cap on remote audio downloads, in bytes.
-_MAX_FETCH_BYTES = int(os.environ.get("CERASE_FETCH_MAX_BYTES", 50 * 1024 * 1024))
+# Cap on remote audio downloads, in bytes: the ceiling the console's file limit
+# is held to (WorkspaceAttachments::CEILING_MB in the control-plane), so a file
+# the console allows is never refused here. Held there by
+# tests/unit/one_file_size_limit.bats.
+_MAX_FETCH_BYTES = int(os.environ.get("CERASE_FETCH_MAX_BYTES", 64 * 1024 * 1024))
 
 # Audio tokenises at a measured,
 # content-independent 25 tokens per second (90,000/hour), and speech
