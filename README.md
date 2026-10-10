@@ -3,8 +3,7 @@
 An MCP server for images, audio and meeting recordings. Five tools send the
 image or audio to one multimodal model alias (`multimodal`) through an
 OpenAI-compatible LiteLLM proxy; the sixth measures and re-encodes a meeting
-recording with ffmpeg and calls no model. The same image also serves an
-OpenAI-style transcription endpoint over HTTP.
+recording with ffmpeg and calls no model.
 
 ## Tools
 
@@ -62,32 +61,6 @@ result is `degraded` when the decoded length is below
 `CERASE_MEETING_MIN_RATIO` of `declared_seconds`, and `silent` when the
 loudest half-second is under `CERASE_MEETING_SILENCE_DB`. A recording longer
 than `CERASE_MEETING_MAX_SECONDS` once decoded is refused.
-
-## Transcription over HTTP
-
-`transcription_api.py` serves `POST /v1/audio/transcriptions` and
-`GET /healthz` over the same chunker. To run the image on it instead of the
-MCP server:
-
-```sh
-docker run --rm -p 8080:8080 \
-  -e CERASE_INTERNAL_SECRET=<bearer> \
-  -e LITELLM_BASE_URL=https://<your-openai-compatible-proxy> \
-  -e LITELLM_MASTER_KEY=<your-key> \
-  --entrypoint python cerase-media-mcp \
-  -m uvicorn --app-dir /app --factory transcription_api:create_app --host 0.0.0.0 --port 8080
-```
-
-Every request must carry `Authorization: Bearer <CERASE_INTERNAL_SECRET>`; with
-the variable unset, every request is refused with 503. The multipart form takes
-`file` (required), `language`, `response_format` (`json`, `text` or
-`verbose_json`) and `stream`, plus two fields of its own: `agent_id` (or the
-`X-Cerase-Agent-Id` header), which is required and is the assistant every model
-call is billed to, and `speaker_timeline`, a JSON array of
-`{start, end, speaker}` that moves the cuts onto speaker changes. A `model`
-field is accepted and ignored. With `stream=true` each piece is sent as a
-`transcript.text.delta` server-sent event as soon as it is transcribed, and the
-stream ends with `transcript.text.done` and `[DONE]`.
 
 ## Settings
 
