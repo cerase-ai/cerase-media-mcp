@@ -509,3 +509,54 @@ class TranscribeChunkingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WhatTheModelIsHandedTest(unittest.TestCase):
+    """The 18:00 Meet on guidance, 11 October: about a minute of Italian came
+    back as «It's too late.». The recording held a voice, mostly quiet (−40 to
+    −55 dB RMS per half-second, loud only for ten seconds), and no beep. The
+    same model, handed a quiet recording of one Italian sentence read eight
+    times, answered one sentence in 3 of 9 runs; levelled first, 0 of 16."""
+
+    def _level(self, mp3: bytes) -> float:
+        import re
+        import subprocess
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".mp3") as f:
+            f.write(mp3)
+            f.flush()
+            out = subprocess.run(
+                ["ffmpeg", "-nostats", "-hide_banner", "-i", f.name, "-af", "volumedetect", "-f", "null", "-"],
+                capture_output=True, text=True, check=True,
+            ).stderr
+        return float(re.search(r"mean_volume: (-?[0-9.]+) dB", out).group(1))
+
+    def test_a_quiet_recording_reaches_the_model_levelled(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(here, "fixtures", "meeting-quiet-speech.webm"), "rb") as f:
+            raw = f.read()
+        mp3, _ = asyncio.run(server._normalise_to_mp3(raw))
+        # The fixture is at about −61 dB; a voice the model is handed sits
+        # where a voice in a call does.
+        self.assertGreater(self._level(mp3), -35.0)
+
+    def test_the_transcriber_takes_no_language(self):
+        # Decided on 11 October: people may speak another language than the
+        # organisation's, and the model tells which on its own.
+        import inspect
+
+        for fn in (server.transcribe, server.transcribe_audio, server.iter_transcription, server._transcribe_piece):
+            self.assertNotIn("language", inspect.signature(fn).parameters, fn.__name__)
+
+    def test_the_prompt_names_no_language_and_asks_for_no_translation(self):
+        seen = []
+
+        async def fake_multimodal(agent_id, content, max_tokens=None):
+            seen.append(content[0]["text"])
+            return "testo"
+
+        with mock.patch.object(server, "_multimodal", fake_multimodal):
+            asyncio.run(server._transcribe_piece("agent-1", b"MP3", 30.0, True))
+        self.assertNotIn("The audio is in", seen[0])
+        self.assertIn("never translate", seen[0])

@@ -13,7 +13,7 @@ recording with ffmpeg and calls no model.
 | `describe_image` | Describes what an image shows: scene, objects, people, setting. | `agent_id`; one of `path`, `image_url`, `image_base64`; optional `prompt`, e.g. the user's own question | `{description, model}` |
 | `analyze_ui` | Audits a UI screenshot: layout, typography, colours, interactive elements, text, visual errors, accessibility, consistency. | `agent_id`; one of `path`, `image_url`, `image_base64` | `{analysis, model}` (Markdown) |
 | `compare_screenshots` | Lists the visual differences between a before and an after screenshot. | `agent_id`; one of `path1`, `image1_url`, `image1_base64`; one of `path2`, `image2_url`, `image2_base64` | `{diff, model}` (Markdown) |
-| `transcribe` | Transcribes an audio file of any length. | `agent_id`; one of `path`, `audio_url`, `audio_base64`; optional `language` hint such as `it` | `{text, model, truncated, duration_seconds, chunks}` |
+| `transcribe` | Transcribes an audio file of any length, in the language it is spoken in, levelled first. | `agent_id`; one of `path`, `audio_url`, `audio_base64` | `{text, model, truncated, duration_seconds, chunks}` |
 | `meeting_normalise` | Downloads a meeting recording from a presigned URL, measures how much audio it really holds, re-encodes it and uploads it to a second presigned URL. | `source_url`, `destination_url`, optional `declared_seconds` | `{decoded_seconds, declared_seconds, bytes, degraded, degraded_reason, loudest_db, silent}` |
 
 Inside Cerase the gateway fills `agent_id` and `agent_binding` (the latter is

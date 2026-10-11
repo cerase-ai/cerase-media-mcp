@@ -18,7 +18,7 @@ Tools:
   - compare_screenshots(agent_id, path1?, image1_url?, image1_base64?,
       path2?, image2_url?, image2_base64?)
       → {diff, model} — visual diff between two screenshots.
-  - transcribe(agent_id, path?, audio_url?, audio_base64?, language?)
+  - transcribe(agent_id, path?, audio_url?, audio_base64?)
       → {text, model} — audio → text (ffmpeg-normalised to mono 16k mp3).
   - meeting_normalise(source_url, destination_url, declared_seconds?)
       → {decoded_seconds, declared_seconds, bytes, degraded, degraded_reason,
@@ -361,8 +361,18 @@ async def _load_audio_bytes(
     return base64.b64decode(payload)
 
 
+# What the audio is levelled with before the model hears it. A meeting's minute
+# of Italian came back as «It's too late.»: the recording held a voice, mostly
+# quiet (−40 to −55 dB RMS per half-second), and the same model handed a quiet
+# recording of one sentence read eight times answered with one sentence in 3 of
+# 9 runs, and in full in 16 of 16 once levelled. Dynamic rather than one gain
+# for the whole file, since the voices of a call are not equally loud. Only
+# what the model is handed is levelled; the recording is measured as it is.
+_LEVELLER = "dynaudnorm=f=150:g=15:p=0.9:m=30"
+
+
 async def _normalise_to_mp3(raw: bytes) -> tuple[bytes, float]:
-    """Transcode arbitrary audio to mono 16k mp3 via ffmpeg (async
+    """Transcode arbitrary audio to a levelled mono 16k mp3 via ffmpeg (async
     subprocess — a long transcode never blocks the other lanes)."""
     with tempfile.TemporaryDirectory() as d:
         src = os.path.join(d, "in")
@@ -370,7 +380,7 @@ async def _normalise_to_mp3(raw: bytes) -> tuple[bytes, float]:
         with open(src, "wb") as f:
             f.write(raw)
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-i", src, "-ac", "1", "-ar", "16000", dst,
+            "ffmpeg", "-y", "-i", src, "-af", _LEVELLER, "-ac", "1", "-ar", "16000", dst,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -622,16 +632,19 @@ async def _slice_mp3(mp3: bytes, start: float, duration: float) -> bytes:
             return f.read()
 
 
-async def _transcribe_piece(
-    agent_id: str, mp3: bytes, duration: float, language: str | None, whole: bool
-) -> str:
+async def _transcribe_piece(agent_id: str, mp3: bytes, duration: float, whole: bool) -> str:
     """One model call for one piece of audio.
 
     A piece that is not the whole recording says so in the prompt: without
     that, a model handed an excerpt that starts mid-sentence tends to
     apologise for the missing context instead of transcribing what it has.
+
+    No language is named: people speak other languages than the
+    organisation's, and the model tells which on its own. It is told only not
+    to translate, since a transcript in another language than the one spoken
+    is not a transcript.
     """
-    hint = f" The audio is in {language}." if language else ""
+    hint = ""
     if not whole:
         hint += (
             " This is an excerpt from a longer recording and may begin or end "
@@ -640,8 +653,9 @@ async def _transcribe_piece(
     return await _multimodal(agent_id, [
         {
             "type": "text",
-            "text": "Transcribe this audio verbatim. Output only the "
-            "transcription, no commentary." + hint,
+            "text": "Transcribe this audio verbatim, every word in the language "
+            "it is spoken in; never translate. Output only the transcription, "
+            "no commentary." + hint,
         },
         {
             "type": "input_audio",
@@ -656,7 +670,6 @@ async def _transcribe_piece(
 async def iter_transcription(
     agent_id: str,
     raw: bytes,
-    language: str | None = None,
     turns: list[chunker.Turn] | None = None,
 ):
     """Transcribe audio of any length, yielding each piece as it lands.
@@ -678,9 +691,7 @@ async def iter_transcription(
             # slicer: what it gains there is the lead silence, without which
             # its first sentence is the one the model drops.
             piece = await _slice_mp3(mp3, chunk.start, chunk.duration)
-            return await _transcribe_piece(
-                agent_id, piece, chunk.duration, language, single
-            )
+            return await _transcribe_piece(agent_id, piece, chunk.duration, single)
 
     tasks = [asyncio.create_task(run(chunk)) for chunk in chunks]
     stitcher = chunker.Stitcher()
@@ -709,7 +720,6 @@ async def iter_transcription(
 async def transcribe_audio(
     agent_id: str,
     raw: bytes,
-    language: str | None = None,
     turns: list[chunker.Turn] | None = None,
 ) -> dict[str, Any]:
     """The whole transcript, assembled. Same path as the streaming form."""
@@ -717,7 +727,7 @@ async def transcribe_audio(
     assembled = ""
     duration = 0.0
     truncated = False
-    async for piece in iter_transcription(agent_id, raw, language, turns):
+    async for piece in iter_transcription(agent_id, raw, turns):
         # A segment carries what its chunk ADDED, not what its chunk heard:
         # the two differ by the overlap, and a caller assembling the segments
         # itself must get the transcript back rather than the transcript with
@@ -746,7 +756,6 @@ async def transcribe(
     path: str | None = None,
     audio_url: str | None = None,
     audio_base64: str | None = None,
-    language: str | None = None,
     agent_binding: str = "",
 ) -> dict[str, Any]:
     """Transcribe an audio file to text via a multimodal LLM.
@@ -758,7 +767,6 @@ async def transcribe(
         path: workspace file path (the form the attachment-receiver skill uses). Use this OR audio_url OR audio_base64.
         audio_url: http(s) URL of the audio — public remote hosts only (local files must use `path`, not a file:// URL).
         audio_base64: a base64 / data-URL audio payload.
-        language: optional ISO hint (e.g. "it") to bias the model.
         agent_binding: injected by the platform (second factor for the workspace-file broker) — do not set it.
 
     Returns:
@@ -769,7 +777,7 @@ async def transcribe(
     raw = await _load_audio_bytes(
         agent_id, path, audio_url, audio_base64, agent_binding
     )
-    result = await transcribe_audio(agent_id, raw, language)
+    result = await transcribe_audio(agent_id, raw)
     return {
         "text": result["text"],
         "model": result["model"],
