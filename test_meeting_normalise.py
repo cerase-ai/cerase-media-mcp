@@ -264,6 +264,58 @@ class Silence(unittest.TestCase):
         self.assertLess(server._MEETING_SILENCE_DB, self.loudest("meeting-quiet-speech.webm") - 10)
 
 
+class Speech(unittest.TestCase):
+    """A recording holds speech only when its sound lasts.
+
+    Measured on a live box: a capture nobody let in recorded 600 s of the
+    lobby, 1,200 of its 1,202 half-seconds at -112 dBFS and two in a row at
+    -50 and -22, the chime the platform plays. Its loudest half-second was far
+    above the silence line, so it was transcribed, and the transcript was 1,438
+    characters of English nobody said. The test sentence, loud or 45 dB
+    quieter, sounds for eight half-seconds in a row.
+    """
+
+    def setUp(self):
+        _ffmpeg_or_fail()
+
+    def test_the_sentence_is_speech(self):
+        levels = asyncio.run(server._half_second_levels(os.path.join(FIXTURES, "meeting-speech.webm")))
+        self.assertGreaterEqual(server._longest_sound_seconds(levels), 4.0)
+        self.assertTrue(server._meeting_has_speech(levels))
+
+    def test_the_quiet_sentence_is_speech(self):
+        levels = asyncio.run(server._half_second_levels(os.path.join(FIXTURES, "meeting-quiet-speech.webm")))
+        self.assertTrue(server._meeting_has_speech(levels))
+
+    def test_a_lobby_with_a_chime_holds_no_speech(self):
+        # The measured lobby, as levels: digital silence and one second of chime.
+        levels = [-112.3] * 600 + [-50.1, -22.3] + [-112.3] * 600
+        self.assertEqual(server._longest_sound_seconds(levels), 1.0)
+        self.assertFalse(server._meeting_has_speech(levels))
+
+    def test_a_chime_recorded_in_a_long_silence_holds_no_speech(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "lobby.webm")
+            subprocess.run(
+                ["ffmpeg", "-nostdin", "-v", "error",
+                 "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono:d=30",
+                 "-f", "lavfi", "-i", "sine=frequency=880:duration=0.8",
+                 "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono:d=30",
+                 "-filter_complex", "[0:a][1:a][2:a]concat=n=3:v=0:a=1",
+                 "-c:a", "libopus", "-b:a", "32k", "-y", path],
+                check=True,
+            )
+            levels = asyncio.run(server._half_second_levels(path))
+        self.assertIsNotNone(server._loudest_level(levels))
+        self.assertFalse(server._meeting_is_silent(server._loudest_level(levels)))
+        self.assertFalse(server._meeting_has_speech(levels))
+
+    def test_silence_holds_no_speech(self):
+        levels = asyncio.run(server._half_second_levels(os.path.join(FIXTURES, "meeting-silent.webm")))
+        self.assertEqual(server._longest_sound_seconds(levels), 0.0)
+        self.assertFalse(server._meeting_has_speech(levels))
+
+
 class BothUrlsAreGuarded(unittest.TestCase):
     """The DESTINATION is new attack surface, and it is a fetch too.
 

@@ -22,7 +22,7 @@ Tools:
       → {text, model} — audio → text (ffmpeg-normalised to mono 16k mp3).
   - meeting_normalise(source_url, destination_url, declared_seconds?)
       → {decoded_seconds, declared_seconds, bytes, degraded, degraded_reason,
-         loudest_db, silent}
+         loudest_db, silent, longest_sound_seconds, speech}
       — measures a meeting recording by DECODING it, normalises it to
       mono 16 kHz Opus and puts it back through a presigned URL.
 
@@ -843,33 +843,46 @@ async def _decoded_seconds(path: str) -> float:
     return last
 
 
-async def _loudest_db(path: str) -> float | None:
-    """The RMS level of the loudest half-second of the recording, in dBFS.
+# A recording holds speech only when its sound lasts. Measured on a live box: a
+# capture nobody let in recorded 600 s of the lobby, 1,200 of its 1,202
+# half-seconds at -112 dBFS and two in a row at -50 and -22, the chime the
+# platform plays. Its loudest half-second was far above the silence line, so it
+# was transcribed into 1,438 characters of English nobody said. The test
+# sentence sounds for eight half-seconds in a row, loud or 45 dB quieter. So a
+# recording holds speech when some stretch of it stays above the silence line
+# for this long without a break, and a chime does not.
+_MEETING_SPEECH_SECONDS = float(os.environ.get("CERASE_MEETING_SPEECH_SECONDS", "2"))
 
-    None when not one sample in it is above zero, or when nothing could be
-    decoded. A half-second rather than the whole file, because a meeting that
-    is mostly quiet is still a meeting: one sentence in an hour has to read as
-    sound. A level rather than a peak, because a single click is not speech.
+# The length of one measured window, in seconds: 8,000 samples at 16 kHz.
+_LEVEL_WINDOW_SECONDS = 0.5
+
+
+async def _half_second_levels(path: str) -> list[float | None]:
+    """The RMS level of every half-second of the recording, in dBFS, in order.
+
+    None for a half-second in which not one sample is above zero. An empty list
+    when nothing could be decoded. A level rather than a peak, because a single
+    click is not speech.
 
     `astats` is reset every frame and the frames are cut to half a second at
     16 kHz; `ametadata` writes each frame's level to a file, which is parsed,
     rather than the human log.
     """
     with tempfile.TemporaryDirectory() as d:
-        levels = os.path.join(d, "levels.txt")
+        levels_file = os.path.join(d, "levels.txt")
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", "0:a:0?",
             "-af", "aresample=16000,asetnsamples=n=8000:p=0,astats=metadata=1:reset=1,"
-                   f"ametadata=mode=print:key=lavfi.astats.Overall.RMS_level:file={levels}",
+                   f"ametadata=mode=print:key=lavfi.astats.Overall.RMS_level:file={levels_file}",
             "-f", "null", "-",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         await proc.communicate()
-        if proc.returncode != 0 or not os.path.exists(levels):
-            return None
-        loudest: float | None = None
-        with open(levels, encoding="utf-8", errors="replace") as f:
+        if proc.returncode != 0 or not os.path.exists(levels_file):
+            return []
+        levels: list[float | None] = []
+        with open(levels_file, encoding="utf-8", errors="replace") as f:
             for line in f:
                 key, _, value = line.strip().partition("=")
                 if key != "lavfi.astats.Overall.RMS_level":
@@ -878,9 +891,39 @@ async def _loudest_db(path: str) -> float | None:
                     level = float(value)
                 except ValueError:
                     continue
-                if level != float("-inf") and (loudest is None or level > loudest):
-                    loudest = level
-        return loudest
+                levels.append(None if level == float("-inf") else level)
+        return levels
+
+
+def _loudest_level(levels: list[float | None]) -> float | None:
+    """The loudest half-second, or None when none of them holds a sample above zero."""
+    heard = [level for level in levels if level is not None]
+    return max(heard) if heard else None
+
+
+async def _loudest_db(path: str) -> float | None:
+    """The RMS level of the loudest half-second of the recording, in dBFS.
+
+    None when not one sample in it is above zero, or when nothing could be
+    decoded. A half-second rather than the whole file, because a meeting that
+    is mostly quiet is still a meeting: one sentence in an hour has to read as
+    sound.
+    """
+    return _loudest_level(await _half_second_levels(path))
+
+
+def _longest_sound_seconds(levels: list[float | None]) -> float:
+    """The longest stretch, in seconds, in which every half-second is above the silence line."""
+    longest = run = 0
+    for level in levels:
+        run = run + 1 if level is not None and level >= _MEETING_SILENCE_DB else 0
+        longest = max(longest, run)
+    return longest * _LEVEL_WINDOW_SECONDS
+
+
+def _meeting_has_speech(levels: list[float | None]) -> bool:
+    """Whether a recording holds a stretch of sound long enough to be somebody speaking."""
+    return _longest_sound_seconds(levels) >= _MEETING_SPEECH_SECONDS
 
 
 def _meeting_is_silent(loudest_db: float | None) -> bool:
@@ -934,7 +977,7 @@ async def meeting_normalise(
         destination_url: presigned PUT for the normalised audio.
         declared_seconds: how long the driver said the meeting was. Compared against the decoded length; 0 means it did not say.
 
-    Returns: dict with `decoded_seconds`, `declared_seconds`, `bytes`, `degraded`, `degraded_reason`, `loudest_db` (dBFS, None when no sample is above zero) and `silent`, true when the loudest half-second is under `_MEETING_SILENCE_DB`: nothing in it to transcribe.
+    Returns: dict with `decoded_seconds`, `declared_seconds`, `bytes`, `degraded`, `degraded_reason`, `loudest_db` (dBFS, None when no sample is above zero), `silent`, true when the loudest half-second is under `_MEETING_SILENCE_DB`, `longest_sound_seconds`, the longest stretch above that line, and `speech`, true when that stretch lasts `_MEETING_SPEECH_SECONDS`: without it there is nothing to transcribe.
     """
     _validate_fetch_url(source_url)
     _validate_fetch_url(destination_url)
@@ -969,7 +1012,8 @@ async def meeting_normalise(
         if decoded <= 0:
             raise ValueError("no audio could be decoded out of the recording")
 
-        loudest = await _loudest_db(src)
+        levels = await _half_second_levels(src)
+        loudest = _loudest_level(levels)
 
         await _to_meeting_opus(src, dst)
         out_bytes = os.path.getsize(dst)
@@ -992,6 +1036,8 @@ async def meeting_normalise(
         "degraded_reason": reason,
         "loudest_db": None if loudest is None else round(loudest, 1),
         "silent": _meeting_is_silent(loudest),
+        "longest_sound_seconds": _longest_sound_seconds(levels),
+        "speech": _meeting_has_speech(levels),
     }
 
 
