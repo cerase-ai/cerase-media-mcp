@@ -222,5 +222,108 @@ class ReconstructsRealProseTest(unittest.TestCase):
         self.assertGreater(_SPOKEN_DURATION, 120.0)
 
 
+class SpeechStretchPlanTest(unittest.TestCase):
+    """Cuts are planned inside the speech and nowhere else."""
+
+    def test_one_short_stretch_is_one_chunk_equal_to_it(self):
+        chunks = chunker.plan_chunks(
+            245.0,
+            target_seconds=120.0,
+            overlap_seconds=6.0,
+            speech=[(100.0, 130.0)],
+        )
+        self.assertEqual(len(chunks), 1)
+        self.assertAlmostEqual(chunks[0].start, 100.0)
+        self.assertAlmostEqual(chunks[0].end, 130.0)
+        self.assertEqual(chunks[0].lead_in, 0.0)
+        self.assertEqual(chunks[0].index, 0)
+
+    def test_two_stretches_leave_the_silence_between_them_uncut(self):
+        chunks = chunker.plan_chunks(
+            600.0,
+            target_seconds=120.0,
+            overlap_seconds=6.0,
+            speech=[(0.0, 100.0), (300.0, 550.0)],
+        )
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual([chunk.index for chunk in chunks], [0, 1, 2])
+        for chunk in chunks:
+            self.assertTrue(chunk.end <= 100.0 or chunk.start >= 300.0)
+        second_stretch = [chunk for chunk in chunks if chunk.start >= 300.0]
+        self.assertAlmostEqual(second_stretch[0].start, 300.0)
+        self.assertEqual(second_stretch[0].lead_in, 0.0)
+        self.assertAlmostEqual(second_stretch[1].start, 414.0)
+        self.assertAlmostEqual(second_stretch[1].lead_in, 6.0)
+        self.assertAlmostEqual(second_stretch[1].end, 550.0)
+
+    def test_no_stretch_is_no_chunks(self):
+        self.assertEqual(chunker.plan_chunks(600.0, speech=[]), [])
+
+    def test_no_speech_timeline_is_the_plan_unchanged(self):
+        self.assertEqual(
+            chunker.plan_chunks(
+                600.0, target_seconds=120.0, overlap_seconds=6.0, speech=None
+            ),
+            chunker.plan_chunks(600.0, target_seconds=120.0, overlap_seconds=6.0),
+        )
+
+
+class CutRepetitionTest(unittest.TestCase):
+    """A model that starts looping is cut where the loop begins."""
+
+    def test_the_second_occurrence_of_a_loop_is_dropped_and_marked(self):
+        italian = "Il relatore ha spiegato che la riunione si terrà domani mattina."
+        french = "Les participants ont confirmé que la réunion aura lieu demain matin."
+        spoken = [
+            french,
+            "les participants ont confirmé que la réunion aura lieu demain matin",
+            "Les participants, ont confirmé que la réunion aura lieu demain matin !",
+            french,
+            "LES PARTICIPANTS ONT CONFIRMÉ QUE LA RÉUNION AURA LIEU DEMAIN MATIN",
+            french,
+            french,
+            "Les participants ont confirmé que la",
+        ]
+        text = (
+            italian
+            + " "
+            + " ".join(spoken)
+            + "\n\n[transcription truncated: output ceiling reached]"
+        )
+        self.assertEqual(
+            chunker.cut_repetition(text),
+            italian + " " + french + chunker.REPETITION_MARKER,
+        )
+
+    def test_a_single_word_loop_is_cut_after_its_first_occurrence(self):
+        self.assertEqual(
+            chunker.cut_repetition(" ".join(["the"] * 30)),
+            "the" + chunker.REPETITION_MARKER,
+        )
+
+    def test_three_no_is_not_a_loop(self):
+        text = "no, no, no, non è così che si fa"
+        self.assertEqual(chunker.cut_repetition(text), text)
+
+    def test_a_sentence_said_twice_is_not_a_loop(self):
+        sentence = "seven bright lanterns lit the quiet old harbour"
+        text = sentence + " " + sentence
+        self.assertEqual(chunker.cut_repetition(text), text)
+
+    def test_a_four_word_phrase_said_three_times_is_too_short(self):
+        phrase = "amber cobalt silver ochre"
+        text = " ".join([phrase] * 3)
+        self.assertEqual(chunker.cut_repetition(text), text)
+
+    def test_the_speech_passage_is_not_cut(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chunker-speech.txt")
+        with open(path, encoding="utf-8") as f:
+            passage = f.read()
+        self.assertEqual(chunker.cut_repetition(passage), passage)
+
+    def test_empty_text_stays_empty(self):
+        self.assertEqual(chunker.cut_repetition(""), "")
+
+
 if __name__ == "__main__":
     unittest.main()

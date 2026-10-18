@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import ipaddress
 import logging
 import mimetypes
@@ -50,6 +51,7 @@ from urllib.parse import urlparse
 from mcp.server.fastmcp import FastMCP
 
 import chunker
+import vad
 
 # MCP stdio transport uses stdout as the JSON-RPC channel — any log on stdout
 # corrupts the protocol. Own the stderr invariant explicitly (don't depend on
@@ -667,21 +669,41 @@ async def _transcribe_piece(agent_id: str, mp3: bytes, duration: float, whole: b
     ], max_tokens=transcription_token_budget(duration))
 
 
-async def iter_transcription(
+async def _speech_runs(mp3: bytes) -> list[tuple[float, float]]:
+    """Where somebody speaks in already-normalised audio.
+
+    No filter is applied here: the mp3 is already levelled, and the detector
+    has to hear the audio the transcription model will hear.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "speech.mp3")
+        with open(path, "wb") as f:
+            f.write(mp3)
+        return await asyncio.to_thread(vad.speech_runs_of, path)
+
+
+async def _iter_normalised(
     agent_id: str,
-    raw: bytes,
+    mp3: bytes,
+    duration: float,
     turns: list[chunker.Turn] | None = None,
 ):
-    """Transcribe audio of any length, yielding each piece as it lands.
+    """Yield the transcript pieces of already-normalised audio as they land.
 
     Pieces are transcribed concurrently but consumed in order, so a caller
     streaming to a meeting driver gets correct text early instead of correct
-    text late: the first piece is a chunk long, not a recording long. Each
-    yielded mapping carries the piece's bounds, its own transcript, and the
-    delta it contributed to the assembled one after the seam was resolved.
+    text late: the first piece is a chunk long, not a recording long. Only the
+    stretches where somebody speaks are transcribed, and a chunk whose model
+    output began repeating itself is cut at the start of the repetition. Each
+    yielded mapping carries the piece's bounds, its own transcript, the delta
+    it contributed to the assembled one after the seam was resolved, and
+    whether the piece was cut for looping.
     """
-    mp3, duration = await _normalise_to_mp3(raw)
-    chunks = chunker.plan_chunks(duration, turns=turns)
+    chunks = chunker.plan_chunks(
+        duration,
+        turns=turns,
+        speech=vad.stretches(await _speech_runs(mp3), duration),
+    )
     limit = asyncio.Semaphore(max(1, _TRANSCRIBE_CONCURRENCY))
     single = len(chunks) == 1
 
@@ -697,7 +719,8 @@ async def iter_transcription(
     stitcher = chunker.Stitcher()
     try:
         for chunk, task in zip(chunks, tasks):
-            text = await task
+            raw_text = await task
+            text = chunker.cut_repetition(raw_text)
             yield {
                 "index": chunk.index,
                 "start": chunk.start,
@@ -707,7 +730,8 @@ async def iter_transcription(
                 "assembled": stitcher.text,
                 "duration_seconds": duration,
                 "chunks": len(chunks),
-                "truncated": text.endswith(TRUNCATION_MARKER),
+                "truncated": raw_text.endswith(TRUNCATION_MARKER),
+                "repeated": text.endswith(chunker.REPETITION_MARKER),
             }
     finally:
         # A consumer that walks away — a disconnected stream, an exception —
@@ -717,34 +741,63 @@ async def iter_transcription(
             task.cancel()
 
 
+async def iter_transcription(
+    agent_id: str,
+    raw: bytes,
+    turns: list[chunker.Turn] | None = None,
+):
+    """Transcribe audio of any length, yielding each piece as it lands.
+
+    The recording is normalised once, then the pieces come from
+    `_iter_normalised`; closing this generator closes that one too, so its
+    pending model calls are cancelled at once.
+    """
+    mp3, duration = await _normalise_to_mp3(raw)
+    async with contextlib.aclosing(
+        _iter_normalised(agent_id, mp3, duration, turns)
+    ) as pieces:
+        async for piece in pieces:
+            yield piece
+
+
 async def transcribe_audio(
     agent_id: str,
     raw: bytes,
     turns: list[chunker.Turn] | None = None,
 ) -> dict[str, Any]:
-    """The whole transcript, assembled. Same path as the streaming form."""
+    """The whole transcript, assembled. Same path as the streaming form.
+
+    Normalising here means the recording's duration is known whether or not
+    any piece was transcribed: a recording in which nobody spoke still lasted
+    what it lasted.
+    """
+    mp3, duration = await _normalise_to_mp3(raw)
     segments: list[dict[str, Any]] = []
     assembled = ""
-    duration = 0.0
     truncated = False
-    async for piece in iter_transcription(agent_id, raw, turns):
-        # A segment carries what its chunk ADDED, not what its chunk heard:
-        # the two differ by the overlap, and a caller assembling the segments
-        # itself must get the transcript back rather than the transcript with
-        # every seam said twice.
-        segments.append({
-            "id": piece["index"],
-            "start": piece["start"],
-            "end": piece["end"],
-            "text": piece["delta"],
-        })
-        assembled = piece["assembled"]
-        duration = piece["duration_seconds"]
-        truncated = truncated or piece["truncated"]
+    repeated = False
+    async with contextlib.aclosing(
+        _iter_normalised(agent_id, mp3, duration, turns)
+    ) as pieces:
+        async for piece in pieces:
+            # A segment carries what its chunk ADDED, not what its chunk heard:
+            # the two differ by the overlap, and a caller assembling the segments
+            # itself must get the transcript back rather than the transcript with
+            # every seam said twice.
+            segments.append({
+                "id": piece["index"],
+                "start": piece["start"],
+                "end": piece["end"],
+                "text": piece["delta"],
+            })
+            assembled = piece["assembled"]
+            truncated = truncated or piece["truncated"]
+            repeated = repeated or piece["repeated"]
     return {
         "text": assembled,
         "model": _MULTIMODAL_ALIAS,
         "truncated": truncated,
+        "repeated": repeated,
         "duration_seconds": duration,
         "segments": segments,
     }
@@ -784,6 +837,7 @@ async def transcribe(
         # Explicit, so a caller can branch without matching the marker string.
         # The marker stays in `text` too, for callers that only read that.
         "truncated": result["truncated"],
+        "repeated": result["repeated"],
         "duration_seconds": result["duration_seconds"],
         "chunks": len(result["segments"]),
     }
@@ -934,6 +988,21 @@ def _meeting_has_speech(levels: list[float | None]) -> bool:
     return _longest_sound_seconds(levels) >= _MEETING_SPEECH_SECONDS
 
 
+async def _meeting_speech(
+    path: str, levels: list[float | None]
+) -> tuple[bool, float]:
+    """Whether a meeting holds a voice, and how many seconds of it.
+
+    The level rule above says a stretch of sound is long enough; this asks the
+    voice detector whether a person is making it. A chime or a noisy room
+    passes the first and fails the second, which is the difference between a
+    recording with something to transcribe and one with only sound.
+    """
+    runs = await asyncio.to_thread(vad.speech_runs_of, path, _LEVELLER)
+    seconds = sum(end - start for start, end in runs)
+    return _meeting_has_speech(levels) and bool(runs), round(seconds, 1)
+
+
 def _meeting_is_silent(loudest_db: float | None) -> bool:
     """Whether a recording holds no sound to transcribe, from its loudest half-second."""
     return loudest_db is None or loudest_db < _MEETING_SILENCE_DB
@@ -985,7 +1054,7 @@ async def meeting_normalise(
         destination_url: presigned PUT for the normalised audio.
         declared_seconds: how long the driver said the meeting was. Compared against the decoded length; 0 means it did not say.
 
-    Returns: dict with `decoded_seconds`, `declared_seconds`, `bytes`, `degraded`, `degraded_reason`, `loudest_db` (dBFS, None when no sample is above zero), `silent`, true when the loudest half-second is under `_MEETING_SILENCE_DB`, `longest_sound_seconds`, the longest stretch above that line, and `speech`, true when that stretch lasts `_MEETING_SPEECH_SECONDS`: without it there is nothing to transcribe.
+    Returns: dict with `decoded_seconds`, `declared_seconds`, `bytes`, `degraded`, `degraded_reason`, `loudest_db` (dBFS, None when no sample is above zero), `silent`, true when the loudest half-second is under `_MEETING_SILENCE_DB`, `longest_sound_seconds`, the longest stretch above that line, `speech_seconds`, how much of the recording the voice detector hears somebody speaking, and `speech`, true when that stretch lasts `_MEETING_SPEECH_SECONDS` and the voice detector hears somebody speak: without it there is nothing to transcribe.
     """
     _validate_fetch_url(source_url)
     _validate_fetch_url(destination_url)
@@ -1022,6 +1091,7 @@ async def meeting_normalise(
 
         levels = await _half_second_levels(src)
         loudest = _loudest_level(levels)
+        speech, speech_seconds = await _meeting_speech(src, levels)
 
         await _to_meeting_opus(src, dst)
         out_bytes = os.path.getsize(dst)
@@ -1045,7 +1115,8 @@ async def meeting_normalise(
         "loudest_db": None if loudest is None else round(loudest, 1),
         "silent": _meeting_is_silent(loudest),
         "longest_sound_seconds": _longest_sound_seconds(levels),
-        "speech": _meeting_has_speech(levels),
+        "speech": speech,
+        "speech_seconds": speech_seconds,
     }
 
 
@@ -1069,4 +1140,8 @@ def _meeting_degradation(declared: float, decoded: float) -> tuple[bool, str]:
 
 
 if __name__ == "__main__":
+    # Load the voice detector at start: an image without the model or the
+    # runtime fails its healthcheck before it is published, rather than on the
+    # first meeting it is asked to transcribe.
+    vad.load()
     mcp.run()

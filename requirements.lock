@@ -29,6 +29,8 @@ cryptography==50.0.1
     # via pyjwt
 distro==1.9.0
     # via openai
+flatbuffers==25.12.19
+    # via onnxruntime
 h11==0.16.0
     # via
     #   httpcore
@@ -60,8 +62,18 @@ mcp==1.30.0
     #   mcp-proxy
 mcp-proxy==0.12.0
     # via -r requirements.txt
+numpy==2.5.4
+    # via
+    #   -r requirements.txt
+    #   onnxruntime
+onnxruntime==1.31.0
+    # via -r requirements.txt
 openai==1.109.1
     # via -r requirements.txt
+packaging==26.3
+    # via onnxruntime
+protobuf==7.36.2
+    # via onnxruntime
 pycparser==3.0 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
     # via cffi
 pydantic==2.13.4

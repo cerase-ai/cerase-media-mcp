@@ -318,15 +318,32 @@ class TranscribeChunkingTest(unittest.TestCase):
 
     def setUp(self):
         self.slices = []
+        self.detected = []
+        self.runs = [(0.0, 1e9)]
 
-    def _run(self, duration, texts=None, **kwargs):
+        async def fake_speech_runs(mp3):
+            self.detected.append(mp3)
+            return self.runs
+
+        patcher = mock.patch.object(server, "_speech_runs", fake_speech_runs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _run(self, duration, texts=None, runs=None, **kwargs):
         """Drive `transcribe_audio` over a recording of `duration` seconds.
 
         The stand-in model reads back which slice it was handed, so a case can
         assert on the piece a call belongs to rather than on the order the
         calls happened to start in -- they run concurrently.
         """
-        self.plan = chunker.plan_chunks(duration, turns=kwargs.get("turns"))
+        import vad
+
+        self.runs = [(0.0, 1e9)] if runs is None else runs
+        self.plan = chunker.plan_chunks(
+            duration,
+            turns=kwargs.get("turns"),
+            speech=vad.stretches(self.runs, duration),
+        )
         self.calls = {}
 
         async def fake_normalise(raw):
@@ -505,6 +522,71 @@ class TranscribeChunkingTest(unittest.TestCase):
         self._run(400.0, texts=["a", "b", "c", "d"], turns=turns)
         self.assertEqual(self.slices[0], (0.0, 131.0))
         self.assertEqual(self.slices[1][0], 131.0)
+
+    def test_a_single_speech_stretch_is_the_only_thing_sliced(self):
+        result = self._run(245.0, runs=[(0.2, 5.0)])
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(self.slices), 1)
+        start, duration = self.slices[0]
+        self.assertAlmostEqual(start, 0.0)
+        self.assertAlmostEqual(duration, 6.0)
+        self.assertTrue(
+            all(start + length <= 6.0 for start, length in self.slices)
+        )
+        self.assertEqual(len(result["segments"]), 1)
+
+    def test_silence_alone_costs_no_model_call(self):
+        result = self._run(245.0, runs=[])
+        self.assertEqual(self.calls, {})
+        self.assertEqual(self.slices, [])
+        self.assertEqual(result["text"], "")
+        self.assertEqual(result["segments"], [])
+        self.assertFalse(result["repeated"])
+        # The recording still lasted what it lasted, though nothing in it was said.
+        self.assertEqual(result["duration_seconds"], 245.0)
+
+    def test_a_long_silence_between_speech_stretches_is_not_sliced(self):
+        self._run(600.0, runs=[(0.0, 100.0), (300.0, 550.0)])
+        self.assertGreaterEqual(len(self.slices), 2)
+        for start, duration in self.slices:
+            self.assertTrue(start + duration <= 101.0 or start >= 299.0)
+
+    def test_the_detector_is_handed_the_levelled_audio(self):
+        self._run(45.0)
+        self.assertEqual(self.detected, [b"NORMALISED"])
+
+    def test_a_looping_chunk_is_cut_and_reported(self):
+        result = self._run(45.0, texts=[" ".join(["the"] * 30)])
+        self.assertEqual(
+            result["text"], "the" + chunker.REPETITION_MARKER
+        )
+        self.assertTrue(result["repeated"])
+        self.assertFalse(result["truncated"])
+
+    def test_a_transcript_that_does_not_loop_is_not_reported(self):
+        text = "one ordinary sentence with no loop in it"
+        result = self._run(45.0, texts=[text])
+        self.assertEqual(result["text"], text)
+        self.assertFalse(result["repeated"])
+
+    def test_the_transcribe_tool_reports_repetition(self):
+        async def fake_load(*args, **kwargs):
+            return b"RAW"
+
+        async def fake_transcribe_audio(agent_id, raw, turns=None):
+            return {
+                "text": "cut" + chunker.REPETITION_MARKER,
+                "model": "model",
+                "truncated": False,
+                "repeated": True,
+                "duration_seconds": 1.0,
+                "segments": [],
+            }
+
+        with mock.patch.object(server, "_load_audio_bytes", fake_load), \
+             mock.patch.object(server, "transcribe_audio", fake_transcribe_audio):
+            result = asyncio.run(server.transcribe("agent-1", audio_base64="eA=="))
+        self.assertTrue(result["repeated"])
 
 
 if __name__ == "__main__":

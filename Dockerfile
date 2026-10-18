@@ -25,7 +25,12 @@ COPY requirements.txt requirements.lock /tmp/
 RUN pip install --no-cache-dir -r /tmp/requirements.lock \
     && rm /tmp/requirements.txt /tmp/requirements.lock
 
-COPY server.py chunker.py /app/
+COPY server.py chunker.py vad.py /app/
+
+# The Silero voice detector and its licence: the model is part of the image,
+# not fetched at start, so a published image either has it or fails before it
+# serves a request.
+COPY models/ /app/models/
 
 # The liveness probe below is a real MCP client, not a socket connect: with the
 # stdio child gone mcp-proxy keeps the listener open and answers the handshake

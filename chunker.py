@@ -12,7 +12,7 @@ the OpenAI-compatible HTTP endpoint a meeting driver posts to, and a pure
 function is the only kind a test can exercise without a model, a gateway and
 an agent.
 
-Two ways to cut:
+Three ways to cut:
 
   - Blind, when nothing is known about the audio. Cuts land on a clock and a
     word will sooner or later straddle one, so each piece after the first
@@ -21,6 +21,9 @@ Two ways to cut:
   - On a speaker timeline, when the caller has one. A turn change is a
     boundary no word crosses, so a cut placed there needs no overlap at all
     and costs no duplicated audio.
+  - Around the stretches where somebody speaks, when a voice detector has
+    said where they are. The silence between stretches is not planned at all,
+    and each stretch is cut as it would have been blind.
 """
 from __future__ import annotations
 
@@ -72,6 +75,20 @@ OVERLAP_WINDOW_SLACK_WORDS = 10
 # accepted. Exact equality is too strict: the same audio transcribed twice
 # comes back with a comma moved or a filler dropped.
 OVERLAP_AGREEMENT = 0.8
+
+# What a transcript says where a loop was cut out of it.
+REPETITION_MARKER = (
+    "\n\n[transcription cut: the model began repeating itself]"
+)
+
+# A model that starts looping does not stop on its own: it runs to its output
+# ceiling, so the repetition is the signal that everything after it is the
+# same words again. People do repeat themselves -- «no, no, no», a sentence said
+# twice for emphasis -- so a loop has to be both long and repeated more than
+# twice before it is cut.
+MIN_LOOP_OCCURRENCES = 3
+MIN_LOOP_WORDS = 24
+MAX_LOOP_UNIT_WORDS = 100
 
 _WORD_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
 
@@ -126,11 +143,17 @@ def plan_chunks(
     target_seconds: float | None = None,
     overlap_seconds: float | None = None,
     turns: Sequence[Turn] | None = None,
+    speech: Sequence[tuple[float, float]] | None = None,
 ) -> list[Chunk]:
     """Where to cut audio of this length.
 
     Audio that already fits comes back as a single chunk with no overlap, so a
     voice note costs exactly what it cost before there was a chunker.
+
+    With `speech`, only those stretches are planned, each one on its own
+    length and with the speaker turns shifted into it. The silence between
+    them is left out entirely, which is what stops a recording nobody spoke in
+    from costing a model call at all.
     """
     target = float(target_seconds if target_seconds is not None else CHUNK_TARGET_SECONDS)
     overlap = float(
@@ -145,6 +168,40 @@ def plan_chunks(
         raise ValueError("overlap_seconds cannot be negative")
     if overlap >= target:
         raise ValueError("overlap_seconds must be shorter than target_seconds")
+    if speech is None:
+        return _plan_span(duration, target, overlap, turns)
+
+    chunks: list[Chunk] = []
+    for stretch_start, stretch_end in sorted(speech):
+        start = max(0.0, min(float(stretch_start), duration))
+        end = max(0.0, min(float(stretch_end), duration))
+        if end <= start:
+            continue
+        span = _plan_span(
+            end - start,
+            target,
+            overlap,
+            _turns_within(turns, start, end),
+        )
+        for chunk in span:
+            chunks.append(
+                Chunk(
+                    index=len(chunks),
+                    start=chunk.start + start,
+                    end=chunk.end + start,
+                    lead_in=chunk.lead_in,
+                )
+            )
+    return chunks
+
+
+def _plan_span(
+    duration: float,
+    target: float,
+    overlap: float,
+    turns: Sequence[Turn] | None,
+) -> list[Chunk]:
+    """Where to cut one span, in seconds from the start of that span."""
     if duration <= target:
         return [Chunk(index=0, start=0.0, end=duration, lead_in=0.0)]
 
@@ -185,6 +242,21 @@ def plan_chunks(
         )
         start_of_next = cut
     return chunks
+
+
+def _turns_within(
+    turns: Sequence[Turn] | None, start: float, end: float
+) -> list[Turn] | None:
+    """The turns clipped to a stretch, in seconds from the stretch's start."""
+    if not turns:
+        return None
+    inside: list[Turn] = []
+    for turn in turns:
+        first = max(start, float(turn.start))
+        last = min(end, float(turn.end))
+        if last > first:
+            inside.append(Turn(first - start, last - start, turn.speaker))
+    return inside
 
 
 def _nearest_change(changes: Sequence[float], target: float, window: float) -> float | None:
@@ -242,6 +314,55 @@ def stitch(chunks: Sequence[Chunk], texts: Sequence[str]) -> str:
     for chunk, text in zip(chunks, texts):
         stitcher.add(chunk, text)
     return stitcher.text
+
+
+def cut_repetition(text: str) -> str:
+    """Cut a transcript where the model began repeating itself.
+
+    A loop is a run of words that repeats at least `MIN_LOOP_OCCURRENCES`
+    times and covers at least `MIN_LOOP_WORDS`, so ordinary emphasis
+    («no, no, no») and a sentence said twice are left alone. The cut is made at
+    the start of the second occurrence, which keeps one honest copy of what was
+    said, and the marker says that the copy was not the end of the speech.
+
+    The first word of a candidate unit is compared before the rest, so
+    ordinary text rejects each candidate in a single comparison rather than a
+    scan through it.
+    """
+    matches = list(_WORD_RE.finditer(text))
+    words = [_normalise(match.group(0)) for match in matches]
+    count = len(words)
+
+    for first in range(count):
+        longest = min(
+            MAX_LOOP_UNIT_WORDS,
+            (count - first) // MIN_LOOP_OCCURRENCES,
+        )
+        for unit in range(1, longest + 1):
+            if words[first] != words[first + unit]:
+                continue
+            occurrences = _times_repeated(words, first, unit)
+            if (
+                occurrences >= MIN_LOOP_OCCURRENCES
+                and unit * occurrences >= MIN_LOOP_WORDS
+            ):
+                cut = matches[first + unit].start()
+                return text[:cut].rstrip() + REPETITION_MARKER
+    return text
+
+
+def _times_repeated(words: Sequence[str], first: int, unit: int) -> int:
+    """How many times, in a row, the unit at `first` starts again."""
+    pattern = words[first:first + unit]
+    occurrences = 0
+    position = first
+    while (
+        position + unit <= len(words)
+        and words[position:position + unit] == pattern
+    ):
+        occurrences += 1
+        position += unit
+    return occurrences
 
 
 def _drop_repeated_head(previous: str, piece: str, lead_in: float) -> str:
