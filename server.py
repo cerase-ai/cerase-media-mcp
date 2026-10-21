@@ -327,7 +327,29 @@ async def _image_data_url(
         mime = mimetypes.guess_type(path)[0] or "image/png"
         b64 = base64.b64encode(data).decode("ascii")
         return f"data:{mime};base64,{b64}"
-    return image_url or image_base64  # type: ignore[return-value]
+    if image_url:
+        return image_url
+    payload = image_base64 or ""
+    if payload.strip().startswith("data:"):
+        return payload.strip()
+    # Plain base64, as the tools' description offers and as `transcribe`
+    # already accepts: the model reads a URL, so the payload becomes a data URL
+    # whose type is read from the bytes. Handed over bare, it answered 400
+    # «Invalid URL format» on lt-name-1 on 20 October.
+    b64 = "".join(payload.split())
+    head = base64.b64decode(b64[:64] + "=" * (-len(b64[:64]) % 4))
+    return f"data:{_image_mime_from_bytes(head)};base64,{b64}"
+
+
+def _image_mime_from_bytes(head: bytes) -> str:
+    """The image type its first bytes declare; PNG when none is recognised."""
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
 
 
 async def _load_audio_bytes(
@@ -468,7 +490,7 @@ async def ocr(
         agent_id: Cerase Agent PK — bound by the gateway. Required.
         path: workspace file path (the form the attachment-receiver skill uses). Use this OR image_url OR image_base64.
         image_url: http(s) URL of the image.
-        image_base64: a `data:image/...;base64,...` data URL.
+        image_base64: plain base64 of the image, or a `data:image/...;base64,...` data URL.
         prompt: optional instruction override (default = full transcription).
         agent_binding: injected by the platform (second factor for the workspace-file broker) — do not set it.
 
@@ -502,7 +524,7 @@ async def describe_image(
         agent_id: Cerase Agent PK — bound by the gateway. Required.
         path: workspace file path (the form the attachment-receiver skill uses). Use this OR image_url OR image_base64.
         image_url: http(s) URL of the image.
-        image_base64: a `data:image/...;base64,...` data URL.
+        image_base64: plain base64 of the image, or a `data:image/...;base64,...` data URL.
         prompt: optional specific question or instruction — pass the user's own question in the user's language to get the answer in that language.
         agent_binding: injected by the platform (second factor for the workspace-file broker) — do not set it.
 
@@ -535,7 +557,7 @@ async def analyze_ui(
         agent_id: Cerase Agent PK — bound by the gateway. Required.
         path: workspace file path (the form the attachment-receiver skill uses). Use this OR image_url OR image_base64.
         image_url: http(s) URL of the screenshot.
-        image_base64: a `data:image/...;base64,...` data URL.
+        image_base64: plain base64 of the image, or a `data:image/...;base64,...` data URL.
         agent_binding: injected by the platform (second factor for the workspace-file broker) — do not set it.
 
     Returns:
@@ -570,10 +592,10 @@ async def compare_screenshots(
         agent_id: Cerase Agent PK — bound by the gateway. Required.
         path1: workspace file path for the baseline screenshot. Use this OR image1_url OR image1_base64.
         image1_url: http(s) URL of the baseline screenshot.
-        image1_base64: data-URL of the baseline screenshot.
+        image1_base64: plain base64 or a data URL of the baseline screenshot.
         path2: workspace file path for the changed screenshot. Use this OR image2_url OR image2_base64.
         image2_url: http(s) URL of the changed screenshot.
-        image2_base64: data-URL of the changed screenshot.
+        image2_base64: plain base64 or a data URL of the changed screenshot.
         agent_binding: injected by the platform (second factor for the workspace-file broker) — do not set it.
 
     Returns:

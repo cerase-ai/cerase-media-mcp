@@ -642,3 +642,61 @@ class WhatTheModelIsHandedTest(unittest.TestCase):
             asyncio.run(server._transcribe_piece("agent-1", b"MP3", 30.0, True))
         self.assertNotIn("The audio is in", seen[0])
         self.assertIn("never translate", seen[0])
+
+
+class ImageDataUrlTest(unittest.TestCase):
+    """`image_base64` takes plain base64 as well as a data URL.
+
+    Handed to the model bare, plain base64 answered 400 «Invalid URL format»
+    on lt-name-1 on 20 October; the type is read from the image bytes.
+    """
+
+    def _resolve(self, image_base64=None, image_url=None):
+        return asyncio.run(
+            server._image_data_url("agent-1", None, image_url, image_base64)
+        )
+
+    @staticmethod
+    def _b64(raw: bytes) -> str:
+        return base64.b64encode(raw).decode("ascii")
+
+    def test_plain_png_base64_becomes_a_png_data_url(self):
+        payload = self._b64(b"\x89PNG\r\n\x1a\n" + b"pixels")
+        result = self._resolve(image_base64=payload)
+        self.assertTrue(result.startswith("data:image/png;base64,"), result)
+        self.assertTrue(result.endswith(payload), result)
+
+    def test_plain_jpeg_base64_becomes_a_jpeg_data_url(self):
+        payload = self._b64(b"\xff\xd8\xff\xe0" + b"pixels")
+        result = self._resolve(image_base64=payload)
+        self.assertTrue(result.startswith("data:image/jpeg;base64,"), result)
+        self.assertTrue(result.endswith(payload), result)
+
+    def test_plain_gif_base64_becomes_a_gif_data_url(self):
+        payload = self._b64(b"GIF89a" + b"pixels")
+        result = self._resolve(image_base64=payload)
+        self.assertTrue(result.startswith("data:image/gif;base64,"), result)
+        self.assertTrue(result.endswith(payload), result)
+
+    def test_plain_webp_base64_becomes_a_webp_data_url(self):
+        payload = self._b64(b"RIFF" + (4).to_bytes(4, "little") + b"WEBP" + b"pixels")
+        result = self._resolve(image_base64=payload)
+        self.assertTrue(result.startswith("data:image/webp;base64,"), result)
+        self.assertTrue(result.endswith(payload), result)
+
+    def test_an_existing_data_url_is_returned_unchanged(self):
+        payload = self._b64(b"\x89PNG\r\n\x1a\n" + b"pixels")
+        data_url = f"data:image/png;base64,{payload}"
+        self.assertEqual(self._resolve(image_base64=data_url), data_url)
+
+    def test_an_http_image_url_is_returned_unchanged(self):
+        url = "https://example.com/a.png"
+        self.assertEqual(self._resolve(image_url=url), url)
+
+    def test_base64_wrapped_in_whitespace_is_accepted(self):
+        payload = self._b64(b"\x89PNG\r\n\x1a\n" + b"pixels")
+        wrapped = "\n  " + payload[:8] + "\r\n" + payload[8:] + "  \n"
+        result = self._resolve(image_base64=wrapped)
+        self.assertTrue(result.startswith("data:image/png;base64,"), result)
+        self.assertTrue(result.endswith(payload), result)
+        self.assertNotRegex(result, r"\s")
