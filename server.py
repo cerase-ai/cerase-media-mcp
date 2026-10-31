@@ -632,6 +632,9 @@ async def _slice_mp3(mp3: bytes, start: float, duration: float) -> bytes:
     back complete. Every cut produces exactly that -- a piece starting on a
     word -- so without this the chunker would lose a sentence at every seam
     and a lone voice note would lose its opening.
+
+    The length bounds what is read from the source, not the output: bounding
+    the output would let the lead silence push the piece's last second out.
     """
     with tempfile.TemporaryDirectory() as d:
         src = os.path.join(d, "in.mp3")
@@ -640,8 +643,8 @@ async def _slice_mp3(mp3: bytes, start: float, duration: float) -> bytes:
             f.write(mp3)
         lead_ms = int(_CHUNK_LEAD_SILENCE_SECONDS * 1000)
         proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-ss", f"{start:.3f}", "-i", src,
-            "-t", f"{max(duration, 0.05):.3f}",
+            "ffmpeg", "-y", "-ss", f"{start:.3f}",
+            "-t", f"{max(duration, 0.05):.3f}", "-i", src,
             "-af", f"adelay={lead_ms}|{lead_ms}",
             "-ac", "1", "-ar", "16000", dst,
             stdout=asyncio.subprocess.PIPE,
