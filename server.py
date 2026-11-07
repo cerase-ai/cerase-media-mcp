@@ -292,19 +292,16 @@ async def _load_workspace_bytes(agent_id: str, path: str, binding: str = "") -> 
         pass  # not a safe local path → let the control-plane re-guard + serve
 
     cp = os.environ.get("CERASE_CONTROL_PLANE_URL", "").rstrip("/")
-    secret = os.environ.get("CERASE_INTERNAL_SECRET", "")
-    if not cp or not secret:
+    if not cp or not agent_id or not binding:
         raise ValueError(
             "workspace `path` given but no local file and no control-plane "
-            "configured (CERASE_CONTROL_PLANE_URL / CERASE_INTERNAL_SECRET)"
+            "configured (CERASE_CONTROL_PLANE_URL / agent_id / agent_binding)"
         )
     import httpx
 
-    # The control-plane broker requires the calling agent's binding
-    # (gateway-injected tool arg) besides the shared bearer.
-    headers = {"Authorization": f"Bearer {secret}"}
-    if binding:
-        headers["X-Cerase-Agent-Binding"] = binding
+    # The control-plane broker authenticates the call by the calling agent's
+    # binding (gateway-injected tool arg).
+    headers = {"X-Cerase-Agent-Binding": binding}
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(
             f"{cp}/api/internal/workspace-file/{agent_id}",

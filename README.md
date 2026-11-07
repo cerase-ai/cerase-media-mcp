@@ -27,9 +27,8 @@ Inputs:
 - A `path` is a file in the calling assistant's workspace. The server reads it
   directly when it exists under `CERASE_TOOL_WORKSPACE_ROOT`; otherwise it
   fetches it from the Cerase control-plane at
-  `GET /api/internal/workspace-file/<agent_id>?path=…`, with
-  `CERASE_INTERNAL_SECRET` as a bearer and `agent_binding` as
-  `X-Cerase-Agent-Binding`. Images read this way reach the model as `data:`
+  `GET /api/internal/workspace-file/<agent_id>?path=…`, with `agent_binding`
+  as `X-Cerase-Agent-Binding`. Images read this way reach the model as `data:`
   URLs.
 - An `image_url` is passed to the model as given, so the model provider
   fetches it, not this server.
@@ -83,7 +82,6 @@ than `CERASE_MEETING_MAX_SECONDS` once decoded is refused.
 | `CERASE_MULTIMODAL_ALIAS` | `multimodal` | Model name every model call uses. It must accept images and `input_audio`. |
 | `CERASE_TOOL_WORKSPACE_ROOT` | `/workspace` | Directory a `path` is read from locally; a path resolving outside it is never opened. |
 | `CERASE_CONTROL_PLANE_URL` | none | Control-plane base URL for the `path` form when the file is not local. |
-| `CERASE_INTERNAL_SECRET` | none | Bearer token for that control-plane request, and the token the HTTP endpoint requires. |
 | `CERASE_FETCH_MAX_BYTES` | `67108864` (64 MiB) | Largest audio or meeting download, and largest upload to the HTTP endpoint. |
 | `CERASE_FETCH_ALLOWED_HOSTS` | empty | Comma-separated hostnames; when set, downloads may reach only these. |
 | `CERASE_TRANSCRIBE_CHUNK_SECONDS` | `120` | Length of one transcription piece. |

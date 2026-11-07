@@ -18,6 +18,7 @@ import base64
 import os
 import socket
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -111,6 +112,56 @@ def _fake_httpx(chunks: list[bytes]):
     return mod
 
 
+def _fake_workspace_httpx(content: bytes = b"file-bytes"):
+    """A stand-in `httpx` module for the workspace-file broker call."""
+    mod = types.ModuleType("httpx")
+
+    class _Resp:
+        def __init__(self, body):
+            self.content = body
+
+        def raise_for_status(self):
+            pass
+
+    class AsyncClient:
+        calls: list[dict] = []
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, params=None, headers=None):
+            AsyncClient.calls.append(
+                {"url": str(url), "params": params, "headers": dict(headers or {})}
+            )
+            return _Resp(content)
+
+    mod.AsyncClient = AsyncClient
+    return mod
+
+
+_WORKSPACE_ROOT = os.path.join(tempfile.gettempdir(), "cerase-media-test-workspace")
+
+
+def _workspace_env(**extra):
+    env = {
+        "CERASE_TOOL_WORKSPACE_ROOT": _WORKSPACE_ROOT,
+        "CERASE_CONTROL_PLANE_URL": "https://control.example",
+    }
+    env.update(extra)
+    return env
+
+
+def _load_workspace(binding: str = "binding-1") -> bytes:
+    path = os.path.join(_WORKSPACE_ROOT, "missing.png")
+    return asyncio.run(server._load_workspace_bytes("agent-1", path, binding))
+
+
 def _load(audio_url: str) -> bytes:
     return asyncio.run(server._load_audio_bytes("a1", None, audio_url, None))
 
@@ -193,6 +244,43 @@ class LoadAudioBytesSinkTest(unittest.TestCase):
         ), mock.patch.object(server, "_MAX_FETCH_BYTES", 16):
             with self.assertRaises(ValueError):
                 _load("https://cdn.example.com/note.wav")
+
+
+class WorkspaceFileBindingTest(unittest.TestCase):
+    """The broker call carries the agent's binding, never the shared secret."""
+
+    def test_the_call_sends_the_binding_and_no_authorization(self):
+        fake = _fake_workspace_httpx(b"image")
+        fake.AsyncClient.calls = []
+        env = _workspace_env(CERASE_INTERNAL_SECRET="shared-secret")
+        with mock.patch.dict(os.environ, env), mock.patch.dict(
+            sys.modules, {"httpx": fake}
+        ):
+            raw = _load_workspace(binding="binding-1")
+        self.assertEqual(raw, b"image")
+        call = fake.AsyncClient.calls[0]
+        self.assertEqual(call["headers"], {"X-Cerase-Agent-Binding": "binding-1"})
+        self.assertNotIn("Authorization", call["headers"])
+
+    def test_the_call_works_with_the_shared_secret_unset(self):
+        fake = _fake_workspace_httpx(b"image")
+        fake.AsyncClient.calls = []
+        with mock.patch.dict(os.environ, _workspace_env()):
+            os.environ.pop("CERASE_INTERNAL_SECRET", None)
+            with mock.patch.dict(sys.modules, {"httpx": fake}):
+                raw = _load_workspace(binding="binding-1")
+        self.assertEqual(raw, b"image")
+        self.assertEqual(len(fake.AsyncClient.calls), 1)
+
+    def test_a_call_without_a_binding_is_refused_before_the_network(self):
+        fake = _fake_workspace_httpx()
+        fake.AsyncClient.calls = []
+        with mock.patch.dict(os.environ, _workspace_env()), mock.patch.dict(
+            sys.modules, {"httpx": fake}
+        ):
+            with self.assertRaisesRegex(ValueError, "agent_binding"):
+                _load_workspace(binding="")
+        self.assertEqual(fake.AsyncClient.calls, [])
 
 
 class TranscriptionTokenBudgetTest(unittest.TestCase):
